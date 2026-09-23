@@ -1,0 +1,4 @@
+[submodule "IsaacSim"]
+	path = IsaacSim
+	url = https://github.com/X-Square-Robot/IsaacSim.git
+	branch = x2real
