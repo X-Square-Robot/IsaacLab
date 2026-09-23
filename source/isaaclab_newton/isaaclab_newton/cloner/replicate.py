@@ -19,6 +19,7 @@ from pxr import Usd
 from isaaclab.physics import PhysicsManager
 from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
 
+from isaaclab_newton.actuators import register_stable_pd_schema
 from isaaclab_newton.cloner.newton_clone_utils import (
     _restore_visible_colliders_without_visual_shapes,
     build_source_builders,
@@ -90,6 +91,10 @@ def _build_newton_builder_from_mapping(
         quaternions[:, 3] = 1.0
 
     schema_resolvers = [SchemaResolverNewton(), SchemaResolverPhysx()]
+
+    # Idempotent guard: registration already fired via the module-level
+    # import, but ensure it precedes add_usd parsing authored actuator prims.
+    register_stable_pd_schema()
     manager_cls = PhysicsManager._sim.physics_manager
 
     builder = manager_cls.create_builder(up_axis=up_axis)

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         IdealPDActuatorCfg,
         ImplicitActuatorCfg,
         RemotizedPDActuatorCfg,
+        StablePDActuatorCfg,
     )
 
 # import logger
@@ -198,6 +199,61 @@ class IdealPDActuator(ActuatorBase):
         control_action.joint_positions = None
         control_action.joint_velocities = None
         return control_action
+
+
+class StablePDActuator(IdealPDActuator):
+    r"""Stable PD actuator (Tan et al. 2011), semi-implicit form.
+
+    Standard explicit PD becomes numerically unstable when the stiffness :math:`k_p` is
+    large relative to the physics time-step :math:`\Delta t`. Stable PD predicts the joint
+    position one step into the future and computes the torque about that predicted state:
+
+    .. math::
+
+        \tau_{j, computed} =
+            - k_p \, (q + \Delta t \, \dot q - q_{des})
+            - k_d \, (\dot q - \dot q_{des})
+            + \tau_{ff}
+
+    Compared with :class:`IdealPDActuator`, the only change is the extra
+    :math:`-k_p \, \Delta t \, \dot q` term, but this lets you push :attr:`stiffness`
+    significantly higher without the joint trajectory ringing or diverging.
+
+    The computed torque is clipped against :attr:`effort_limit` and applied as a pure
+    joint effort. This law is evaluated by Newton's in-graph actuator kernel
+    (``use_newton_actuators=True``); the Python :meth:`compute` is intentionally
+    disabled and raises if reached -- StablePD has no non-Newton fallback.
+
+    .. note::
+        The predictor uses the *physics sub-step* dt (not the policy dt
+        ``decimation * sim.dt``). This is handled by Newton's in-graph
+        ``ControllerStablePD``, which reads the sub-step dt directly.
+
+    Reference:
+        J. Tan, K. Liu, G. Turk. *Stable Proportional-Derivative Controllers*.
+        IEEE Computer Graphics and Applications, 2011.
+    """
+
+    cfg: StablePDActuatorCfg
+    """The configuration for the actuator model."""
+
+    """
+    Operations.
+    """
+
+    def compute(
+        self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+    ) -> ArticulationActions:
+        # StablePD torque is computed exclusively by Newton's in-graph actuator
+        # kernel (use_newton_actuators=True), which bypasses this method entirely.
+        # Reaching the Python path means Newton actuators were not active -- which
+        # is unsupported, so fail loudly instead of silently running a control law
+        # the surrounding pipeline does not expect.
+        raise RuntimeError(
+            "StablePDActuator.compute() was called, but StablePD requires Newton actuators "
+            "(use_newton_actuators=True); the Python SPD fallback is intentionally disabled. "
+            "Enable Newton actuators (isaaclab_newton.actuators) or pick a different actuator_model."
+        )
 
 
 class DCMotor(IdealPDActuator):

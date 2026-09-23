@@ -24,13 +24,21 @@ USD authoring lives on the schema side as
 call into it via :meth:`ArticulationCfg._post_spawn`.
 """
 
-from .adapter import NewtonActuatorAdapter, build_newton_actuator_defaults
+from .adapter import NewtonActuatorAdapter, build_newton_actuator_defaults, resolve_stable_pd_gravity_modes
 from .kernels import build_implicit_dof_mask
 from .physx_wrapper import PhysxActuatorWrapper
+from .stable_pd_registration import register_stable_pd_schema
+
+# Register NewtonStablePDControlAPI → ControllerStablePD with Newton's USD
+# actuator parser so StablePDActuatorCfg configs resolve to the implicit
+# Tan 2011 controller. No-ops on Newton builds without ControllerStablePD.
+register_stable_pd_schema()
 
 __all__ = [
     "NewtonActuatorAdapter",
     "PhysxActuatorWrapper",
     "build_implicit_dof_mask",
     "build_newton_actuator_defaults",
+    "register_stable_pd_schema",
+    "resolve_stable_pd_gravity_modes",
 ]

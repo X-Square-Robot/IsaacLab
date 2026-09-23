@@ -1628,7 +1628,6 @@ def test_gravity_vec_w_tracks_model_gravity(sim, num_articulations, device, add_
     # GRAVITY_VEC_W must share storage with Newton's per-env gravity array.
     model = SimulationManager.get_model()
     model_gravity_arr = model.gravity[: model.world_count]
-    global_gravity = wp.to_torch(model.gravity)[-1].clone()
     assert articulation.data.GRAVITY_VEC_W.warp.ptr == model_gravity_arr.ptr
     assert articulation.data.GRAVITY_VEC_W.shape == (num_articulations,)
 
@@ -1643,7 +1642,6 @@ def test_gravity_vec_w_tracks_model_gravity(sim, num_articulations, device, add_
 
     # Live view: new per-env values are visible immediately, no invalidation step.
     torch.testing.assert_close(articulation.data.GRAVITY_VEC_W.torch, new_gravity)
-    torch.testing.assert_close(wp.to_torch(model.gravity)[-1], global_gravity)
 
     # Recompute the lazily-cached projected_gravity_b without sim.step (which would
     # drift root orientation from the reset state). Project against the same quat

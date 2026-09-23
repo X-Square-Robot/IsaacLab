@@ -42,6 +42,14 @@ class PhysxCfg(PhysicsCfg):
     class_type: type[PhysxManager] | str = "{DIR}.physx_manager:PhysxManager"
     """The class type of the PhysxManager."""
 
+    fabric_skip: bool = False
+    """Skip the PhysX-to-Fabric transform write-back on intermediate substeps. Default is False.
+
+    Rendering only consumes the state left by the last substep of each render interval
+    (:attr:`~isaaclab.sim.SimulationCfg.render_interval`); the other write-backs are
+    suppressed via ``/physics/fabricUpdateTransformations``. Effective only when Fabric is active.
+    """
+
     # ------------------------------------------------------------------
     # Solver Settings
     # ------------------------------------------------------------------

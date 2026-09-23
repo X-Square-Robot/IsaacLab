@@ -912,6 +912,21 @@ class BaseArticulationData(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not implement gravity_compensation_forces.")
 
+    @property
+    def coriolis_centrifugal_compensation_forces(self) -> ProxyArray:
+        """Per-env Coriolis and centrifugal compensation torques ``C(q, q_dot) q_dot`` in joint space.
+
+        Shape: ``(num_instances, num_joints + num_base_dofs)``, dtype ``wp.float32``
+        [N·m or N, per DoF type]. DoF-axis convention matches
+        :attr:`body_link_jacobian_w`.
+
+        ``C(q, q_dot) q_dot`` is the velocity-product term in
+        ``M(q) q_ddot + C(q, q_dot) q_dot + g(q) = tau``. Together with
+        :attr:`gravity_compensation_forces` it forms the full inverse-dynamics bias
+        (the RNEA output at ``q_ddot = 0``): ``tau = C(q, q_dot) q_dot + g(q)``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement coriolis_centrifugal_compensation_forces.")
+
     ##
     # Joint state properties.
     ##

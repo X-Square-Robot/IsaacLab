@@ -795,43 +795,40 @@ class MeshCollisionBaseCfg:
     _usd_attr_name_map: ClassVar[dict] = {}
     _usd_field_exceptions: ClassVar[dict] = {}
 
+    @property
+    def usd_api(self) -> str | None:
+        """Deprecated legacy USD mesh-collision API name."""
+        warnings.warn(
+            "'usd_api' attribute is deprecated and will be removed in 4.0. Use class-level"
+            " metadata via getattr(cfg, '_usd_applied_schema').",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        schema = getattr(type(self), "_usd_applied_schema", None)
+        # Every PhysX cooking subclass legacy-mapped to ``MeshCollisionAPI``; the base
+        # class also wrote that token. Return ``None`` only when no schema is declared.
+        return "MeshCollisionAPI" if schema is not None else None
+
+    @property
+    def physx_api(self) -> str | None:
+        """Deprecated legacy PhysX mesh-collision cooking API name."""
+        warnings.warn(
+            "'physx_api' attribute is deprecated and will be removed in 4.0. Use class-level"
+            " metadata via getattr(cfg, '_usd_applied_schema').",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        schema = getattr(type(self), "_usd_applied_schema", None)
+        if schema and schema.startswith("Physx"):
+            return schema
+        return None
+
     mesh_approximation_name: str = "none"
     """Name of mesh collision approximation method. Default: "none".
 
     Writes ``physics:approximation`` via :class:`UsdPhysics.MeshCollisionAPI`.
     Refer to :const:`schemas.MESH_APPROXIMATION_TOKENS` for available options.
     """
-
-    def __getattr__(self, name: str):
-        """Deprecated read-only access to the legacy ``usd_api`` / ``physx_api`` instance attrs.
-
-        Falls back here only when the attribute is not found on the dataclass instance.
-        Returns the legacy-mapped string value derived from the class-level
-        ``_usd_applied_schema`` metadata and emits a ``DeprecationWarning``.
-        """
-        if name == "usd_api":
-            warnings.warn(
-                "'usd_api' attribute is deprecated and will be removed in 4.0. Use class-level"
-                " metadata via getattr(cfg, '_usd_applied_schema').",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            schema = self.__dict__.get("_usd_applied_schema", None)
-            # Every PhysX cooking subclass legacy-mapped to ``"MeshCollisionAPI"``; the base
-            # class also wrote that token. Return ``None`` only when no schema is declared.
-            return "MeshCollisionAPI" if schema is not None else None
-        if name == "physx_api":
-            warnings.warn(
-                "'physx_api' attribute is deprecated and will be removed in 4.0. Use class-level"
-                " metadata via getattr(cfg, '_usd_applied_schema').",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            schema = self.__dict__.get("_usd_applied_schema", None)
-            if schema and schema.startswith("Physx"):
-                return schema
-            return None
-        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
 
 @configclass

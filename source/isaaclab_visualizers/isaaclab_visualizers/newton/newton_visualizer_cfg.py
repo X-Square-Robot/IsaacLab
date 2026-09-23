@@ -16,6 +16,25 @@ class NewtonVisualizerCfg(VisualizerCfg):
     visualizer_type: str = "newton"
     """Type identifier for Newton visualizer."""
 
+    renderer: str = "gl"
+    """Newton viewer rendering backend: ``"gl"`` (OpenGL rasterizer, default) or ``"rtx"``.
+
+    ``"gl"`` uses :class:`newton.viewer.ViewerGL` and exposes the full Isaac Lab control
+    panel (joint control, joint limits, inertia boxes, sky/light editing). ``"rtx"`` uses
+    :class:`newton.viewer.ViewerRTX` (Omniverse OVRTX path-traced renderer, kitless) for
+    higher visual fidelity; it keeps the Isaac Lab simulation/rendering pause controls but
+    relies on the RTX viewer's own rendering UI for the rest. The RTX path requires the
+    ``newton[rtx]`` extra (``ovrtx``); on environments where the OVRTX native libraries fail
+    to load it falls back to the OpenGL renderer.
+    """
+
+    rtx_environment: str = "default"
+    """RTX viewer scene environment preset: ``"default"``, ``"studio"`` or ``"none"``.
+
+    Only consulted when :attr:`renderer` is ``"rtx"``. Mirrors
+    :paramref:`newton.viewer.ViewerRTX.environment`.
+    """
+
     window_width: int = 1920
     """Window width in pixels."""
 
@@ -36,6 +55,20 @@ class NewtonVisualizerCfg(VisualizerCfg):
 
     show_joints: bool = False
     """Show joint visualization."""
+
+    show_joint_limits: bool = False
+    """Show joint position-limit arcs (revolute) and segments (prismatic)."""
+
+    joint_limit_radius: float = 0.12
+    """Radius [m] of the revolute limit arc (also reused as the limit-arc display scale)."""
+
+    show_joint_zero_ref_lines: bool = False
+    """Show Kit-style zero-angle reference dashed line for each revolute joint.
+
+    Emulates the Kit/PhysX UI ``_target0_rotation_baseline_transform`` dashed marker: the
+    zero-angle direction is aligned to the child body AABB side-center farthest from the
+    joint anchor, projected onto the plane perpendicular to the joint axis.
+    """
 
     show_contacts: bool = False
     """Show contact visualization."""

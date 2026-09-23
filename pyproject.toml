@@ -52,7 +52,7 @@ dependencies = [
     "pyglet>=2.1.6,<3",
     "transformers==4.57.6",
     "einops",
-    "warp-lang==1.16.0.dev20260723",
+    "warp-lang>=1.16.0",
     "matplotlib>=3.10.3",
     # pillow: floor, not exact — an exact pin below Isaac Sim's prebundled version forces a
     # downgrade that deletes the prebundled copy other extensions symlink into (nvbugs 6410989).
@@ -86,11 +86,12 @@ dependencies = [
     "onnxscript>=0.5",
     # ----- newton (default physics engine) -----
     # Loose bound so the wheel co-resolves with isaacsim's newton[sim]==1.2.0 pin; the
-    # exact git commit is forced via [tool.uv].override-dependencies (uv sync only).
-    # The importers extra carries the mesh-processing deps (coacd, fast-simplification,
-    # ...) that honoring USD-authored ``physics:approximation`` requires.
+    # publication source is forced via [tool.uv].override-dependencies.
+    # The importers extra carries the mesh-processing dependencies needed to honor
+    # USD-authored ``physics:approximation`` values.
     "newton[sim,importers]>=1.2.0",
-    # Loose bound co-resolves with isaacsim's ==0.2.0; the override below forces >=0.4.0.
+    # Loose bound co-resolves with isaacsim's ==0.2.0; the override below forces the
+    # internal fork vendored in the newton repo (extern/newton-usd-schemas).
     "newton-usd-schemas>=0.2.0",
     "PyOpenGL-accelerate>=3.1.0",
     # ----- newton interactive viewer GUI (in base, no extra required) -----
@@ -146,9 +147,9 @@ rerun = [
     "rerun-sdk>=0.29.0",
     "pyarrow==22.0.0",  # match rerun-sdk's Arrow stack
 ]
-
+# Isaac Sim (PhysX backend); co-resolves with the base install via the [tool.uv] conflicts table.
 isaacsim = ["isaacsim[all,extscache]==6.0.1.0"]
-
+# Omniverse renderer / physics backends (``ov`` / ``ovphysx`` / ``ovrtx`` selectors).
 ov = ["ovphysx==0.5.9", "ovrtx>=0.4.0,<0.5.0", "ovstage>=0.1.0,<0.2.0"]
 ovphysx = ["ovphysx==0.5.9", "ovstage>=0.1.0,<0.2.0"]
 ovrtx = ["ovrtx>=0.4.0,<0.5.0", "ovstage>=0.1.0,<0.2.0"]
@@ -201,8 +202,9 @@ torchaudio = "2.11.0"
 ovphysx = "0.5.9"
 ovrtx = ">=0.4.0,<0.5.0"
 ovstage = ">=0.1.0,<0.2.0"
-newton = "10402ecbaf2d8afda00507123155042cbcb5c3fb"
-warp = "1.16.0.dev20260723"
+# Newton tracks the publishable GitLab branch tip, not a pinned commit.
+newton = "publication"
+warp = ">=1.16.0"
 
 [tool.ruff]
 line-length = 120
@@ -383,9 +385,10 @@ override-dependencies = [
     "numpy>=2",
     "mujoco~=3.11.0",
     "mujoco-warp~=3.11.0",
-    "newton[sim,importers] @ git+https://github.com/newton-physics/newton.git@10402ecbaf2d8afda00507123155042cbcb5c3fb",
-    # Force the Newton-matched schemas over isaacsim's ==0.2.0 pin.
-    "newton-usd-schemas>=0.4.0",
+    # Internal publication branch tip with StablePD/schema support; every install pulls latest.
+    "newton[sim,importers] @ git+ssh://git@gitlab.zbl.local:50022/mana/engine/newton.git@publication",
+    # Newton-matched schemas, vendored inside the newton repo; overrides isaacsim's ==0.2.0 pin.
+    "newton-usd-schemas @ git+ssh://git@gitlab.zbl.local:50022/mana/engine/newton.git@publication#subdirectory=extern/newton-usd-schemas",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "torchaudio==2.11.0",
@@ -410,6 +413,13 @@ conflicts = [
 ]
 python-preference = "only-managed"
 package = false
+
+# newton-usd-schemas builds from the git source (see override-dependencies above).
+# Its hatchling backend emits Metadata-Version 2.4, which imports packaging.licenses
+# — added only in packaging>=24.2. Force a new-enough hatchling/packaging into the
+# isolated build env so the from-source build does not fail on old packaging.
+[tool.uv.extra-build-dependencies]
+newton-usd-schemas = ["hatchling>=1.27.0", "packaging>=24.2"]
 
 [tool.uv.sources]
 omniverseclient = { index = "pypi-public" }

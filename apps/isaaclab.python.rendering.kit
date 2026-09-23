@@ -133,6 +133,7 @@ folders = [
     "${exe-path}/exts",  # kit extensions
     "${exe-path}/extscore",  # kit core extensions
     "${exe-path}/../exts",  # isaac extensions
+    "${app}/../IsaacSim/source/extensions",  # local Isaac Sim source extensions
     "${exe-path}/../extscache",  # isaac cache extensions
     "${exe-path}/../extsPhysics",  # isaac physics extensions
     "${exe-path}/../isaacsim/exts",  # isaac extensions for pip
@@ -145,6 +146,13 @@ folders = [
 [settings.persistent]
 UJITSO.geometry = true
 UJITSO.enabled = true
+
+# Show the FPS counter in the viewport HUD by default. In Isaac Sim 6.0 the HUD
+# moved to per-viewport ``hud/*/visible`` keys, and the per-viewport persistent
+# value takes precedence over ``app/viewport/defaults/...``. So the default
+# viewport ("Viewport0" of the "Viewport" window) must be set explicitly here.
+[settings.persistent.app.viewport."Viewport/Viewport0".hud.renderFPS]
+visible = true
 
 # Asset path
 # set the S3 directory manually to the latest published S3

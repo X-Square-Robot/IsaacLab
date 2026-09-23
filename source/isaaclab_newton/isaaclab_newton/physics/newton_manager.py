@@ -12,7 +12,9 @@ import ctypes
 import gc
 import inspect
 import logging
+import math
 import re
+import warnings
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -32,6 +34,72 @@ except OSError:
         _cudart = ctypes.CDLL("libcudart.so")
     except OSError:
         _cudart = None
+from newton import (
+    Axis,
+    CollisionPipeline,
+    Contacts,
+    Control,
+    Heightfield,
+    JointType,
+    Model,
+    ModelBuilder,
+    ModelFlags,
+    ShapeFlags,
+    State,
+    eval_fk,
+)
+from newton.sensors import SensorContact as NewtonContactSensor
+from newton.sensors import SensorFrameTransform
+from newton.sensors import SensorIMU as NewtonSensorIMU
+from newton.solvers import SolverBase, SolverKamino
+from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
+
+from pxr import Usd, UsdGeom
+
+from isaaclab.physics import CallbackHandle, PhysicsEvent, PhysicsManager
+from isaaclab.scene_data import SceneDataBackend, SceneDataFormat, SceneDataProvider
+from isaaclab.scene_data.deformable_vis_remap import (
+    VolumeVisRemap,
+    launch_batch_particle_slice_copy,
+    launch_batch_volume_vis_remap,
+)
+from isaaclab.sim import SimulationContext
+from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
+from isaaclab.sim.utils.queries import has_deformable_curve_api
+from isaaclab.sim.utils.stage import get_current_stage
+from isaaclab.utils import checked_apply
+from isaaclab.utils.string import resolve_matching_names
+from isaaclab.utils.timer import Timer
+from isaaclab.utils.version import has_kit
+from isaaclab.utils.warp.index_kernel import IndexKernelDispatcher
+
+from isaaclab_newton.actuators import register_stable_pd_schema
+from isaaclab_newton.cloner.newton_clone_utils import (
+    _restore_visible_colliders_without_visual_shapes,
+    replicate_builder_mapping,
+)
+from isaaclab_newton.physics.visualization_builder import build_visualization_builder_from_stage_envs
+from isaaclab_newton.physics.visualization_deformables import populate_shadow_deformable_registry
+
+from .newton_manager_cfg import NewtonCfg, NewtonShapeCfg
+
+if TYPE_CHECKING:
+    from isaaclab_newton.actuators import NewtonActuatorAdapter
+
+    from .newton_collision_cfg import NewtonCollisionPipelineCfg
+
+logger = logging.getLogger(__name__)
+
+_NEWTON_SHAPE_COLOR_REPLACEMENT_WARNING = (
+    "Newton shape color replacement is enabled; this workaround will be deprecated in a future release."
+)
+
+
+def _replace_newton_builder_shape_colors_without_warning(builder: Any, stage: Usd.Stage) -> int:
+    """Replace Newton shape colors while suppressing the known compatibility warning."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=_NEWTON_SHAPE_COLOR_REPLACEMENT_WARNING, category=FutureWarning)
+        return replace_newton_builder_shape_colors(builder, stage)
 
 
 @contextlib.contextmanager
@@ -66,60 +134,6 @@ def _paused_gc():
             gc.collect(0)
 
 
-from newton import (
-    Axis,
-    CollisionPipeline,
-    Contacts,
-    Control,
-    Heightfield,
-    Model,
-    ModelBuilder,
-    ModelFlags,
-    ShapeFlags,
-    State,
-    eval_fk,
-)
-from newton.sensors import SensorContact as NewtonContactSensor
-from newton.sensors import SensorFrameTransform
-from newton.sensors import SensorIMU as NewtonSensorIMU
-from newton.solvers import SolverBase, SolverKamino
-from newton.usd import SchemaResolverNewton, SchemaResolverPhysx
-
-from pxr import Usd, UsdGeom
-
-from isaaclab.physics import CallbackHandle, PhysicsEvent, PhysicsManager
-from isaaclab.scene_data import SceneDataBackend, SceneDataFormat, SceneDataProvider
-from isaaclab.scene_data.deformable_vis_remap import (
-    VolumeVisRemap,
-    launch_batch_particle_slice_copy,
-    launch_batch_volume_vis_remap,
-)
-from isaaclab.sim import SimulationContext
-from isaaclab.sim.utils.newton_model_utils import replace_newton_builder_shape_colors
-from isaaclab.sim.utils.queries import has_deformable_curve_api
-from isaaclab.sim.utils.stage import get_current_stage
-from isaaclab.utils import checked_apply
-from isaaclab.utils.string import resolve_matching_names
-from isaaclab.utils.timer import Timer
-from isaaclab.utils.version import has_kit
-from isaaclab.utils.warp.index_kernel import IndexKernelDispatcher
-
-from isaaclab_newton.cloner.newton_clone_utils import (
-    _restore_visible_colliders_without_visual_shapes,
-    replicate_builder_mapping,
-)
-from isaaclab_newton.physics.visualization_builder import build_visualization_builder_from_stage_envs
-from isaaclab_newton.physics.visualization_deformables import populate_shadow_deformable_registry
-
-from .newton_manager_cfg import NewtonCfg, NewtonShapeCfg
-
-if TYPE_CHECKING:
-    from isaaclab_newton.actuators import NewtonActuatorAdapter
-
-    from .newton_collision_cfg import NewtonCollisionPipelineCfg
-
-logger = logging.getLogger(__name__)
-
 # Tagged union for entries in _cl_site_index_map.
 # _GlobalSite: (global_shape_idx, None)           — body_pattern was None
 # _LocalSite:  (None, [[env0_idx, ...], ...])     — per-world site indices
@@ -130,17 +144,30 @@ def _set_fabric_transforms(
     fabric_transforms: wp.fabricarray(dtype=wp.mat44d),
     newton_indices: wp.fabricarray(dtype=wp.uint32),
     newton_body_q: wp.array(ndim=1, dtype=wp.transformf),
+    body_render_scale: wp.array(ndim=1, dtype=wp.vec3),
 ):
     """Write Newton body transforms to Fabric world matrices.
 
     For each Fabric prim at thread ``i``, reads the Newton body transform at
     ``newton_body_q[newton_indices[i]]`` and stores it as a column-major
     ``mat44d`` in ``fabric_transforms[i]``.
+
+    ``body_q`` is a pure rigid transform (no scale), so writing it as the prim's
+    full world matrix discards the prim's authored ``xformOp:scale`` (Newton
+    decomposes that into ``Model.shape_scale`` at import and never re-composes it
+    for rendering). We post-multiply the rigid matrix by the body prim's local
+    scale ``S`` so the Kit viewport renders ``T·R·S`` -- matching the physics body
+    (which bakes scale into its collision mesh) and the raytraced camera (which
+    uses ``shape_scale``). Without this, every scaled rigid prim renders at unit
+    size in the Newton viewport while physics/recordings are correctly scaled.
     """
     i = int(wp.tid())
     idx = int(newton_indices[i])
     transform = newton_body_q[idx]
-    fabric_transforms[i] = wp.transpose(wp.mat44d(wp.transform_to_matrix(transform)))
+    s = body_render_scale[idx]
+    scale_mat = wp.diag(wp.vec4(s[0], s[1], s[2], 1.0))
+    world = wp.mul(wp.transform_to_matrix(transform), scale_mat)
+    fabric_transforms[i] = wp.transpose(wp.mat44d(world))
 
 
 @wp.kernel(enable_backward=False)
@@ -399,8 +426,7 @@ class NewtonManager(PhysicsManager):
     _supports_contact_sensors: bool = True
 
     # Per-world reset masks (allocated in start_simulation, consumed in step/forward).
-    # Newton reserves the final slot for global entities in world -1.
-    _world_reset_mask: wp.array | None = None  # (num_envs + 1,) wp.bool
+    _world_reset_mask: wp.array | None = None  # (num_envs,) wp.bool — for SolverKamino.reset(world_mask=...)
     _fk_reset_mask: wp.array | None = None  # (articulation_count,) wp.bool — for eval_fk(mask=...)
     # Solver-specialized FK delegate. Bound in initialize_solver() to the active subclass's choice of FK implementation.
     _eval_fk: Callable[[wp.array | None, wp.array | None], None] = _eval_fk_unbound
@@ -413,6 +439,13 @@ class NewtonManager(PhysicsManager):
     # substeps, in registration order. Multiple articulations register their
     # implicit-DOF telemetry / FF-routing kernels here.
     _post_actuator_callbacks: list[Callable[[], None]] = []
+    # Hooks invoked *before* the actuator step, in registration order. Used to
+    # populate per-step actuator inputs that the controller reads (e.g. the
+    # mass matrix / bias forces required by ``ControllerStablePD``). These run
+    # on the eager actuator timeline (a registered pre-actuator callback forces
+    # :meth:`_is_all_graphable` to ``False``), so they may use Python-guarded
+    # data accessors that are not CUDA-graph-capturable.
+    _pre_actuator_callbacks: list[tuple[Callable[[], None], bool]] = []
     # In-graph hooks invoked after the last solver substep and before sensors,
     # in registration order. Articulations with non-identity ordering register
     # their backend-to-user state republish kernels here so the reorders are
@@ -449,6 +482,11 @@ class NewtonManager(PhysicsManager):
     _newton_particle_offset_attr = "newton:particleOffset"
     _newton_particle_count_attr = "newton:particleCount"
     _particle_visual_prims: dict[str, _ParticleVisualPrim] = {}
+
+    # Per-body local render scale (indexed by body index, aligned with body_q).
+    # Restores each prim's authored xformOp:scale that the rigid body_q writeback
+    # would otherwise drop; rebuilt at fabric-body bind, cleared on reset.
+    _body_render_scale: wp.array | None = None
 
     # Cached after the first fabric sync that probes IFabricHierarchy GPU APIs.
     _use_fabric_gpu_hierarchy: bool | None = None
@@ -701,10 +739,15 @@ class NewtonManager(PhysicsManager):
 
                 fabric_transforms = wp.fabricarray(selection, "omni:fabric:worldMatrix")
                 newton_indices = wp.fabricarray(selection, cls._newton_index_attr)
+                if cls._body_render_scale is None:
+                    # Safety net: identity scale if the bind-time build was skipped.
+                    cls._body_render_scale = wp.full(
+                        cls._model.body_count, wp.vec3(1.0, 1.0, 1.0), dtype=wp.vec3, device=PhysicsManager._device
+                    )
                 wp.launch(
                     _set_fabric_transforms,
                     dim=newton_indices.shape[0],
-                    inputs=[fabric_transforms, newton_indices, cls._state_0.body_q],
+                    inputs=[fabric_transforms, newton_indices, cls._state_0.body_q, cls._body_render_scale],
                     device=PhysicsManager._device,
                 )
                 wp.synchronize_device(PhysicsManager._device)
@@ -976,6 +1019,8 @@ class NewtonManager(PhysicsManager):
             PhysicsManager._sim_time += physics_dt * cls._decimation
         else:
             # --- Some actuators not graph-safe: step them eagerly, graph solver only ---
+            for cb, _ in cls._pre_actuator_callbacks:
+                cb()
             if cls._adapter is not None:
                 cls._adapter.step(cls._state_0, cls._control, physics_dt)
             for cb in cls._post_actuator_callbacks:
@@ -1062,6 +1107,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._supports_contact_sensors = True
         NewtonManager._adapter = None
         NewtonManager._post_actuator_callbacks = []
+        NewtonManager._pre_actuator_callbacks = []
         NewtonManager._post_step_callbacks = []
         # Set by an articulation that took the ``use_newton_actuators=True``
         # branch in ``_process_actuators_cfg``.  Together with the adapter
@@ -1082,6 +1128,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._sensor_bvh_has_collision_shapes = False
         NewtonManager._newton_stage_path = None
         NewtonManager._usdrt_stage = None
+        NewtonManager._body_render_scale = None
         NewtonManager._transforms_dirty = False
         NewtonManager._transforms_may_change_on_graph_replay = False
         NewtonManager._particles_dirty = False
@@ -1175,8 +1222,36 @@ class NewtonManager(PhysicsManager):
 
         Override in solver subclasses that need to adapt imported or replicated
         builder data before :meth:`ModelBuilder.finalize` allocates model arrays.
-        The default implementation is a no-op.
+        Overrides should call ``super()._prepare_builder_for_finalize(builder)``.
         """
+        cls._set_actuator_dofs_to_effort_mode(builder)
+
+    @classmethod
+    def _set_actuator_dofs_to_effort_mode(cls, builder: ModelBuilder) -> None:
+        """Set ``joint_target_mode = EFFORT`` for every composed-actuator DOF.
+
+        A composed actuator (:meth:`ModelBuilder.add_actuator`) writes its control
+        law into ``joint_f``; that effort only applies when the DOF is ``EFFORT``
+        rather than the gain-inferred ``POSITION`` default. Must run before ``finalize``:
+        solvers bake joint-DOF config at build time and reject later changes.
+        """
+        from newton import JointTargetMode  # noqa: PLC0415
+
+        actuator_entries = getattr(builder, "actuator_entries", None)
+        if not actuator_entries:
+            return
+        effort = int(JointTargetMode.EFFORT)
+        num_dofs = len(builder.joint_target_mode)
+        flipped: set[int] = set()
+        for entry in actuator_entries.values():
+            for dof in entry.indices:
+                if 0 <= dof < num_dofs:
+                    builder.joint_target_mode[dof] = effort
+                    builder.joint_target_ke[dof] = 0.0
+                    builder.joint_target_kd[dof] = 0.0
+                    flipped.add(dof)
+        if flipped:
+            logger.info("Set %d composed-actuator DOF(s) to JointTargetMode.EFFORT.", len(flipped))
 
     @classmethod
     def cl_register_site(cls, body_pattern: str | None, xform: wp.transform, *, per_world: bool = False) -> str:
@@ -1516,6 +1591,17 @@ class NewtonManager(PhysicsManager):
         # In the replication path, _cl_inject_sites() already ran from newton_replicate.
         cls._cl_inject_sites_fallback()
 
+        # Disable glibc fastbins/tcache to prevent heap corruption when Newton's
+        # native allocator coexists with Kit's runtime in the same process.
+        try:
+            import ctypes.util
+
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            M_MXFAST = 1  # glibc mallopt param: max fast bin size; 0 disables fastbins
+            libc.mallopt(M_MXFAST, 0)
+        except Exception:
+            pass
+
         device = PhysicsManager._device
         logger.info(f"Finalizing model on device: {device}")
         cls._builder.up_axis = Axis.from_string(cls._up_axis)
@@ -1546,10 +1632,11 @@ class NewtonManager(PhysicsManager):
         # observe the canonical state regardless of which subclass is active.
         NewtonManager._adapter = None
         NewtonManager._use_newton_actuators_active = False
+        NewtonManager._pre_actuator_callbacks = []
+        NewtonManager._post_actuator_callbacks = []
 
-        # Newton's final reset-mask slot selects global entities in world -1.
-        # Isaac Lab resets local environments only, so that slot remains false.
-        NewtonManager._world_reset_mask = wp.zeros(cls._model.world_count + 1, dtype=wp.bool, device=device)
+        # Allocate per-world reset masks (used by all solvers for masked FK, and by Kamino for masked reset).
+        NewtonManager._world_reset_mask = wp.zeros(cls._model.world_count, dtype=wp.bool, device=device)
         NewtonManager._fk_reset_mask = wp.zeros(cls._model.articulation_count, dtype=wp.bool, device=device)
 
         logger.info("Dispatching PHYSICS_READY callbacks")
@@ -1587,6 +1674,20 @@ class NewtonManager(PhysicsManager):
     @staticmethod
     def _initialize_fabric_body_prims(stage, fabric_hierarchy, usdrt, body_bindings: Sequence[tuple[str, int]]) -> None:
         """Initialize Fabric body prims used by Newton transform sync."""
+        import numpy as np
+
+        from pxr import Gf, Usd
+
+        # Capture each body prim's authored local scale so the rigid body_q
+        # writeback in _set_fabric_transforms can re-compose T·R·S (see that
+        # kernel). We read the *prim's own local* scale -- not Model.shape_scale,
+        # the full world scale -- because any scale authored on a child mesh is
+        # still applied by the Fabric hierarchy; double-counting it here would
+        # render at scale^2. Default (1,1,1) for prims without an authored scale.
+        usd_stage = get_current_stage()
+        body_count = NewtonManager._model.body_count
+        body_scale = np.ones((body_count, 3), dtype=np.float32)
+
         for prim_path, body_index in body_bindings:
             prim = stage.GetPrimAtPath(prim_path)
             if prim.IsValid():
@@ -1597,12 +1698,21 @@ class NewtonManager(PhysicsManager):
                 xformable_prim = usdrt.Rt.Xformable(prim)
                 xformable_prim.CreateFabricHierarchyWorldMatrixAttr()
 
+            usd_prim = usd_stage.GetPrimAtPath(prim_path)
+            if usd_prim.IsValid() and UsdGeom.Xformable(usd_prim):
+                local_xf = UsdGeom.Xformable(usd_prim).GetLocalTransformation(Usd.TimeCode.Default())
+                scale = Gf.Transform(local_xf).GetScale()
+                if 0 <= body_index < body_count:
+                    body_scale[body_index] = (scale[0], scale[1], scale[2])
+
             prim.CreateAttribute(NewtonManager._newton_index_attr, usdrt.Sdf.ValueTypeNames.UInt, custom=True)
             prim.GetAttribute(NewtonManager._newton_index_attr).Set(body_index)
             # Tag with PhysicsRigidBodyAPI so FabricHierarchyGpuUpdateOptions.RIGID_BODY
             # applies Inverse propagation (preserves Newton's world transforms and derives
             # local) instead of Forward.
             prim.AddAppliedSchema("PhysicsRigidBodyAPI")
+
+        NewtonManager._body_render_scale = wp.array(body_scale, dtype=wp.vec3, device=PhysicsManager._device)
 
         fabric_hierarchy.update_world_xforms()
 
@@ -1774,6 +1884,10 @@ class NewtonManager(PhysicsManager):
 
         schema_resolvers = [SchemaResolverNewton(), SchemaResolverPhysx()]
 
+        # Idempotent guard: registration already fired via the module-level
+        # import, but ensure it precedes add_usd parsing authored actuator prims.
+        register_stable_pd_schema()
+
         # NOTE: None of the add_usd calls below pass joint_ordering or
         # bodies_follow_joint_ordering, so the live articulation's native
         # joint/body order comes from Newton's ModelBuilder.add_usd defaults
@@ -1787,11 +1901,12 @@ class NewtonManager(PhysicsManager):
         hf_ignore_paths = cls._inject_terrain_heightfields(stage, builder)
 
         if not env_paths:
-            # No env Xforms — flat loading
+            # No env Xforms — flat loading (a single world)
             import_result = builder.add_usd(stage, ignore_paths=hf_ignore_paths, schema_resolvers=schema_resolvers)
             _restore_visible_colliders_without_visual_shapes(builder, stage, import_result["path_shape_map"])
-            replace_newton_builder_shape_colors(builder, stage)
+            _replace_newton_builder_shape_colors_without_warning(builder, stage)
             NewtonManager._world_xforms = [wp.transform()]
+            NewtonManager._num_envs = 1
             for hook in cls._per_world_builder_hooks:
                 hook(builder, 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
         else:
@@ -1800,7 +1915,7 @@ class NewtonManager(PhysicsManager):
             ignore_paths = [path for _, path in env_paths] + hf_ignore_paths
             import_result = builder.add_usd(stage, ignore_paths=ignore_paths, schema_resolvers=schema_resolvers)
             _restore_visible_colliders_without_visual_shapes(builder, stage, import_result["path_shape_map"])
-            replace_newton_builder_shape_colors(builder, stage)
+            _replace_newton_builder_shape_colors_without_warning(builder, stage)
 
             _, proto_path = env_paths[0]
             source_builders = {proto_path: cls.create_builder(up_axis=up_axis)}
@@ -1810,7 +1925,7 @@ class NewtonManager(PhysicsManager):
             _restore_visible_colliders_without_visual_shapes(
                 source_builders[proto_path], stage, import_result["path_shape_map"]
             )
-            replace_newton_builder_shape_colors(source_builders[proto_path], stage)
+            _replace_newton_builder_shape_colors_without_warning(source_builders[proto_path], stage)
             cls._cl_protos = source_builders
 
             global_site_indices, source_site_indices, env_root_sites = cls._cl_inject_sites(builder, source_builders)
@@ -1846,7 +1961,190 @@ class NewtonManager(PhysicsManager):
             NewtonManager._world_xforms = world_xforms
             NewtonManager._num_envs = len(env_paths)
 
+        # PhysX authors angular mimic offset/gearing in degrees but Newton uses radians, and the USD
+        # importer copies them verbatim -- a ~57.3x (180/pi) mismatch that under-drives angular mimics
+        # (e.g. a gripper). Normalize before finalize; only deg-calibrated mimics are converted.
+        cls._normalize_physx_angular_mimic_offsets_from_stage(builder, stage)
+
         cls.set_builder(builder)
+
+    @classmethod
+    def _normalize_physx_angular_mimic_offsets_from_stage(cls, builder: object, stage: object) -> int:
+        """Convert imported PhysX angular mimic offsets and gearing to radians.
+
+        PhysX authors ``physxMimicJoint:*:offset`` for angular joints in
+        degrees, matching other USD angular joint attributes. Newton stores
+        revolute joint coordinates in radians, so a raw ``-offset`` imported
+        into ``constraint_mimic_coef0`` makes the mimic constraint fight
+        position targets by roughly 57.3x. This manager-side normalization
+        keeps MJWarp stable without patching the packaged Newton importer.
+
+        The companion :meth:`_normalize_physx_angular_mimic_gearing` fixes the
+        *gearing* half (``constraint_mimic_coef1``), which carries the same
+        per-degree-vs-per-radian mismatch for a prismatic follower geared off a
+        revolute leader. Both run here so the deg->rad fix lives entirely in the
+        integration layer; the generic Newton importer (``coef1 = -gearing``)
+        stays unit-agnostic and is intentionally left untouched.
+        """
+        from pxr import UsdPhysics  # noqa: PLC0415
+
+        labels = getattr(builder, "constraint_mimic_label", None)
+        coef0_values = getattr(builder, "constraint_mimic_coef0", None)
+        if not labels or coef0_values is None:
+            return cls._normalize_physx_angular_mimic_gearing(builder)
+
+        converted_count = 0
+        for index, label in enumerate(labels):
+            prim = stage.GetPrimAtPath(label)
+            if not prim or not prim.IsValid():
+                continue
+            if not prim.IsA(UsdPhysics.RevoluteJoint):
+                continue
+
+            schemas_listop = prim.GetMetadata("apiSchemas")
+            if not schemas_listop:
+                continue
+            all_schemas = (
+                list(schemas_listop.prependedItems)
+                + list(schemas_listop.appendedItems)
+                + list(schemas_listop.explicitItems)
+            )
+
+            for schema in all_schemas:
+                schema_text = str(schema)
+                if not schema_text.startswith("PhysxMimicJointAPI:rot"):
+                    continue
+
+                axis_instance = schema_text.split(":", maxsplit=1)[1]
+                offset_attr = prim.GetAttribute(f"physxMimicJoint:{axis_instance}:offset")
+                if offset_attr is None or not offset_attr.HasValue():
+                    continue
+
+                offset_degrees = float(offset_attr.Get())
+                imported_coef0 = float(coef0_values[index])
+                expected_imported_coef0 = -offset_degrees
+                expected_radian_coef0 = -math.radians(offset_degrees)
+                if math.isclose(imported_coef0, expected_radian_coef0, rel_tol=1.0e-6, abs_tol=1.0e-7):
+                    continue
+                if not math.isclose(imported_coef0, expected_imported_coef0, rel_tol=1.0e-6, abs_tol=1.0e-6):
+                    continue
+
+                coef0_values[index] = expected_radian_coef0
+                converted_count += 1
+                break
+
+        if converted_count > 0:
+            logger.info("Converted %d PhysX angular mimic offset(s) from degrees to radians.", converted_count)
+        # Fix the gearing (coef1) half on the same pass.
+        converted_count += cls._normalize_physx_angular_mimic_gearing(builder)
+        return converted_count
+
+    @classmethod
+    def _normalize_physx_angular_mimic_gearing(cls, builder: object) -> int:
+        """Rescale per-degree angular-mimic *gearing* (coef1) to per-radian.
+
+        Companion to the *offset* (coef0) normalization above. The packaged
+        Newton USD importer copies the authored ``physxMimicJoint:*:gearing``
+        straight into ``constraint_mimic_coef1`` (``coef1 = -gearing``) with no
+        unit conversion. PhysX authors angular gearing in **degrees** while
+        Newton/MuJoCo evaluate revolute coordinates in **radians**, so a
+        prismatic follower geared off a revolute leader (e.g. a rack-and-pinion
+        gripper) gets a ratio calibrated in metres-per-degree while the solver
+        feeds it radians -- the mimic equality ``q_f = coef0 + coef1 * q_l`` then
+        under-drives the follower by ``180/pi`` (~57.3x).
+
+        Detection is **self-validating and asset-agnostic** (no joint-name
+        hard-coding): a constraint is rescaled only when the follower is
+        PRISMATIC and the stored gearing is ~57.3x too small to reproduce the
+        follower's travel span from the leader span (see
+        :meth:`_is_degree_calibrated_mimic_gearing`). This catches both a
+        prismatic follower geared off a revolute leader (per-degree gearing left
+        unconverted) and a chained prismatic-follower/prismatic-leader finger
+        mimic whose intended dimensionless coefficient the importer multiplied
+        by ``pi/180``. An asset whose stored gearing already explains the span
+        is left untouched, so this is safe to run unconditionally. Operates on
+        the builder arrays directly (no USD stage read), so it composes with the
+        offset pass above.
+
+        Returns the number of gearing coefficients converted.
+        """
+        joint0 = getattr(builder, "constraint_mimic_joint0", None)
+        joint1 = getattr(builder, "constraint_mimic_joint1", None)
+        coef1_values = getattr(builder, "constraint_mimic_coef1", None)
+        if not joint0 or joint1 is None or coef1_values is None:
+            return 0
+
+        converted_count = 0
+        for index in range(len(joint0)):
+            follower = int(joint0[index])
+            leader = int(joint1[index])
+            if not cls._is_degree_calibrated_mimic_gearing(builder, follower, leader, coef1_values[index]):
+                continue
+            coef1_values[index] = float(coef1_values[index]) * (180.0 / math.pi)
+            converted_count += 1
+
+        if converted_count > 0:
+            logger.info(
+                "Converted %d PhysX angular mimic gearing coefficient(s) from per-degree to per-radian.",
+                converted_count,
+            )
+        return converted_count
+
+    @classmethod
+    def _is_degree_calibrated_mimic_gearing(cls, builder: object, follower: int, leader: int, coef1: float) -> bool:
+        """True when a mimic constraint's gearing is under-scaled by ``180/pi``.
+
+        Self-validating signature: the authored gearing reproduces the
+        follower's travel span from the leader span scaled up by ``180/pi``
+        (``math.degrees``) but NOT from the leader span as stored -- i.e. the
+        stored coefficient is ~57.3x too small. The importer produces this in
+        two ways, both keyed off the ``physxMimicJoint`` *axis instance* name
+        (``rot*`` vs ``trans*``) rather than the real joint type:
+
+        - A PRISMATIC follower geared off a REVOLUTE leader whose axis was
+          authored ``rot*``: the per-degree gearing is copied verbatim while
+          Newton evaluates the revolute leader in radians.
+        - A PRISMATIC follower geared off a PRISMATIC leader whose axis was
+          authored ``rot*`` (a chained finger mimic): the importer treats the
+          follower as angular and multiplies the intended dimensionless
+          coefficient by ``pi/180``.
+
+        Both are corrected by the same ``180/pi`` rescale, so the leader may be
+        REVOLUTE or PRISMATIC. An asset that legitimately authored a gearing the
+        stored leader span already explains fails the test and is left
+        untouched, so this is safe to run unconditionally.
+        ``gearing = -coef1`` (the importer stores ``coef1 = -gearing``).
+        """
+        jtype = getattr(builder, "joint_type", None)
+        lower = getattr(builder, "joint_limit_lower", None)
+        upper = getattr(builder, "joint_limit_upper", None)
+        qd_start = getattr(builder, "joint_qd_start", None)
+        if jtype is None or lower is None or upper is None or qd_start is None:
+            return False
+        if not (0 <= follower < len(jtype) and 0 <= leader < len(jtype)):
+            return False
+        if int(jtype[follower]) != int(JointType.PRISMATIC):
+            return False
+        if int(jtype[leader]) not in (int(JointType.REVOLUTE), int(JointType.PRISMATIC)):
+            return False
+        if follower >= len(qd_start) or leader >= len(qd_start):
+            return False
+
+        fdof = int(qd_start[follower])
+        ldof = int(qd_start[leader])
+        if not (0 <= fdof < len(lower) and 0 <= ldof < len(lower)):
+            return False
+
+        follower_span = abs(float(upper[fdof]) - float(lower[fdof]))
+        leader_span = abs(float(upper[ldof]) - float(lower[ldof]))
+        gearing = abs(float(coef1))
+        if follower_span <= 0.0 or leader_span <= 0.0 or gearing <= 0.0:
+            return False
+
+        deg_match = math.isclose(gearing * math.degrees(leader_span), follower_span, rel_tol=0.1)
+        rad_match = math.isclose(gearing * leader_span, follower_span, rel_tol=0.1)
+        # Convert only when degrees explains the span and radians clearly does not.
+        return deg_match and not rad_match
 
     @classmethod
     def _initialize_contacts(cls) -> None:
@@ -1956,6 +2254,10 @@ class NewtonManager(PhysicsManager):
 
         Default no-op.  Subclasses override to release sub-solver references
         or other solver-specific resources.
+
+        Called after all base-class state (including :attr:`_solver`) has been
+        reset — overrides must not depend on :attr:`_solver` being alive; put
+        such logic in :meth:`close` before ``super().close()`` instead.
         """
 
     @classmethod
@@ -2301,6 +2603,8 @@ class NewtonManager(PhysicsManager):
             if cls._needs_collision_pipeline:
                 cls._collision_pipeline.collide(cls._state_0, cls._contacts)
 
+            for cb, _ in cls._pre_actuator_callbacks:
+                cb()
             if cls._adapter is not None:
                 cls._adapter.step(cls._state_0, cls._control, physics_dt)
             for cb in cls._post_actuator_callbacks:
@@ -2640,6 +2944,143 @@ class NewtonManager(PhysicsManager):
             )
             NewtonManager._model = None
             NewtonManager._state_0 = None
+
+    @classmethod
+    def _build_visualization_model_from_stage(cls, stage) -> ModelBuilder | None:
+        """Build a fresh Newton ``ModelBuilder`` from the USD stage for visualization.
+
+        Walks IsaacLab's ``/World/envs/env_<id>`` convention and adds each env as
+        its own Newton world. When the env subtree is identical across envs (the
+        common cloned-scene case) a single env_0 prototype is built once and
+        replicated via :meth:`ModelBuilder.add_builder`; otherwise each env is
+        ingested independently with :meth:`ModelBuilder.add_usd`.
+
+        This routine is intentionally independent of
+        :meth:`instantiate_builder_from_stage` (which targets the live-sim path
+        and uses a different naming convention and writes into ``cls._builder``
+        and ``cls._cl_site_index_map``). The visualization shadow path must not
+        pollute those live-sim slots. ``cls._num_envs`` is populated here too so
+        :meth:`get_num_envs` returns the env count when the sim backend is PhysX
+        (the live-sim path never runs in that configuration, so there is no slot
+        to collide with).
+
+        Args:
+            stage: USD stage to inspect.
+
+        Returns:
+            A populated :class:`~newton.ModelBuilder`, or ``None`` when no
+            ``/World/envs/env_<id>`` prims exist on the stage.
+        """
+        import re
+
+        from pxr import UsdGeom
+
+        up_axis_token = UsdGeom.GetStageUpAxis(stage)
+        up_axis = Axis.from_string(str(up_axis_token))
+        schema_resolvers = [SchemaResolverNewton(), SchemaResolverPhysx()]
+
+        env_pattern = re.compile(r"^env_(\d+)$")
+        env_paths: list[tuple[int, str]] = []
+        envs_root = stage.GetPrimAtPath("/World/envs")
+        if envs_root and envs_root.IsValid():
+            for child in envs_root.GetChildren():
+                if match := env_pattern.match(child.GetName()):
+                    env_paths.append((int(match.group(1)), child.GetPath().pathString))
+        env_paths.sort(key=lambda x: x[0])
+
+        builder = ModelBuilder(up_axis=up_axis)
+        builder.validate_inertia_detailed = True
+
+        if not env_paths:
+            # Fallback: ingest the whole stage as a single world.
+            builder.add_usd(stage, schema_resolvers=schema_resolvers)
+            NewtonManager._num_envs = 1
+            return builder
+
+        NewtonManager._num_envs = len(env_paths)
+
+        # Ingest stage-level (non-env) geometry into the global world (``current_world == -1``)
+        # so visualization sees the ground plane, ceilings, fixed props, etc. The legacy
+        # cloner-based prebuild did this via ``add_usd(stage, ignore_paths=["/World/envs"], ...)``
+        # before adding the per-env worlds; without this, renderers/visualizers driven off the
+        # shadow Newton model are missing every shape authored outside the env hierarchy.
+        builder.add_usd(
+            stage,
+            ignore_paths=[r"/World/envs($|/.*)"],
+            schema_resolvers=schema_resolvers,
+        )
+
+        # Build env_0 as a prototype, then replicate across envs.
+        proto_env_path = env_paths[0][1]
+        proto = ModelBuilder(up_axis=up_axis)
+        proto.validate_inertia_detailed = True
+        proto.add_usd(
+            stage,
+            root_path=proto_env_path,
+            schema_resolvers=schema_resolvers,
+        )
+
+        xform_cache = UsdGeom.XformCache()
+
+        # ``add_builder`` copies the prototype's ``body_label`` (and sibling label arrays)
+        # verbatim into each replicated world, so all worlds end up with prim paths under
+        # the prototype env (e.g. ``/World/envs/env_0/...``). The visualization sync uses
+        # these labels to map PhysX transforms (which carry distinct per-env paths) into
+        # ``state.body_q``; without rewriting, ``paths.index()`` resolves every match to
+        # world 0 and worlds 1..N never receive fresh poses. Rewrite the newly-added
+        # labels after each ``add_builder`` so each world references its own env prim path.
+        label_attrs = ("body_label", "articulation_label", "joint_label", "shape_label")
+        label_starts = {attr: len(getattr(builder, attr)) for attr in label_attrs}
+
+        # ``proto.add_usd`` ingests env_0's bodies at their absolute world positions
+        # (``UsdPhysics.LoadUsdPhysicsFromRange`` reports world-space transforms), so
+        # ``proto.body_q`` already encodes env_0's world transform. ``add_builder``
+        # composes its ``xform`` onto every imported body, so passing each env's
+        # absolute world transform here would double the offset; the correct xform is
+        # the env's pose relative to the prototype (identity for env_0, env_X * env_0^-1
+        # for the rest). Dynamic bodies are overwritten in ``update_visualization_state``
+        # via the PhysX sync, but static bodies (e.g. the table) keep this initial pose
+        # and render at the wrong position when env_0 is not at the world origin.
+        proto_world_gf = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(proto_env_path))
+        proto_translation = proto_world_gf.ExtractTranslation()
+        proto_rotation = proto_world_gf.ExtractRotationQuat()
+        proto_world_tf = wp.transform(
+            (proto_translation[0], proto_translation[1], proto_translation[2]),
+            (
+                proto_rotation.GetImaginary()[0],
+                proto_rotation.GetImaginary()[1],
+                proto_rotation.GetImaginary()[2],
+                proto_rotation.GetReal(),
+            ),
+        )
+        proto_world_tf_inv = wp.transform_inverse(proto_world_tf)
+
+        for _, env_path in env_paths:
+            world_xform = xform_cache.GetLocalToWorldTransform(stage.GetPrimAtPath(env_path))
+            translation = world_xform.ExtractTranslation()
+            rotation = world_xform.ExtractRotationQuat()
+            env_world_tf = wp.transform(
+                (translation[0], translation[1], translation[2]),
+                (
+                    rotation.GetImaginary()[0],
+                    rotation.GetImaginary()[1],
+                    rotation.GetImaginary()[2],
+                    rotation.GetReal(),
+                ),
+            )
+            relative_tf = wp.transform_multiply(env_world_tf, proto_world_tf_inv)
+            builder.begin_world()
+            builder.add_builder(proto, xform=relative_tf)
+            if env_path != proto_env_path:
+                for attr in label_attrs:
+                    labels = getattr(builder, attr)
+                    for i in range(label_starts[attr], len(labels)):
+                        labels[i] = labels[i].replace(proto_env_path, env_path, 1)
+            for attr in label_attrs:
+                label_starts[attr] = len(getattr(builder, attr))
+            builder.end_world()
+
+        return builder
 
     @classmethod
     def get_scene_data_provider(cls) -> SceneDataProvider:
@@ -2998,6 +3439,16 @@ class NewtonManager(PhysicsManager):
         return cls._solver_dt
 
     @classmethod
+    def get_solver(cls) -> SolverBase | None:
+        """Get the active Newton solver, or ``None`` if none is built.
+
+        Returns the live solver (e.g. the MuJoCo Warp solver) so callers can inspect
+        post-conversion state such as the compiled MuJoCo model. ``None`` on backends
+        with no Newton solver (e.g. the PhysX shadow-visualization path).
+        """
+        return cls._solver
+
+    @classmethod
     def _is_all_graphable(cls) -> bool:
         """``True`` when the decimation loop can be captured into a CUDA graph.
 
@@ -3008,6 +3459,13 @@ class NewtonManager(PhysicsManager):
              actuator in the adapter is CUDA-graph-safe.
         """
         if not cls._use_newton_actuators_active:
+            return False
+        # A pre-actuator callback registered as non-graphable (e.g. one using
+        # Python-guarded data accessors that cannot be captured into a CUDA
+        # graph) forces the eager actuator path. Callbacks registered as
+        # graphable (pure wp.launch into pre-allocated buffers) are captured
+        # into the full-decimation graph alongside the adapter step.
+        if any(not graphable for _, graphable in cls._pre_actuator_callbacks):
             return False
         return cls._adapter is None or cls._adapter.is_all_graphable
 
@@ -3059,6 +3517,29 @@ class NewtonManager(PhysicsManager):
         registered callbacks fire in registration order each step.
         """
         cls._post_actuator_callbacks.append(callback)
+
+    @classmethod
+    def register_pre_actuator_callback(cls, callback: Callable[[], None], graphable: bool = False) -> None:
+        """Append a hook invoked *before* the actuator step on every iteration.
+
+        Pre-actuator callbacks populate per-step actuator inputs that the
+        controller reads during :meth:`NewtonActuatorAdapter.step` — for
+        example the mass matrix and bias forces that
+        :class:`newton.actuators.ControllerStablePD` requires each step.
+        All registered callbacks fire in registration order, before the
+        adapter step, every iteration.
+
+        Args:
+            callback: The zero-argument hook to run before the adapter step.
+            graphable: Whether the callback issues only CUDA-graph-capturable
+                work (pure ``wp.launch`` / ``wp.copy`` into pre-allocated
+                buffers, no Python-guarded data accessors and no host
+                synchronization). When ``True`` the callback can be captured
+                into the full-decimation graph. When ``False`` (default) its
+                presence forces :meth:`_is_all_graphable` to ``False`` and the
+                whole actuator step runs eagerly.
+        """
+        cls._pre_actuator_callbacks.append((callback, graphable))
 
     @classmethod
     def register_post_step_callback(cls, callback: Callable[[], None]) -> None:

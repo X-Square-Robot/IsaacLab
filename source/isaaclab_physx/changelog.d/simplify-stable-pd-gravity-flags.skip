@@ -1,0 +1,3 @@
+Internal cleanup only: collapsed the two always-equal StablePD gravity flags
+into one and removed the unreachable partial-compensation bias branch in the
+PhysX articulation. No behavior change.

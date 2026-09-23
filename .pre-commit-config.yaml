@@ -77,6 +77,14 @@ repos:
       - id: rst-inline-touching-normal
   - repo: local
     hooks:
+      - id: lazy-stubs-sync
+        name: Check .pyi stubs are in sync with lazy_export modules
+        entry: bash -c 'python3 source/isaaclab/tools/generate_lazy_stubs.py && git diff --exit-code "*.pyi"'
+        language: system
+        pass_filenames: false
+        files: "source/isaaclab.*/.*__init__\\.py$"
+  - repo: local
+    hooks:
       - id: check-git-lfs-pointers
         name: check Git LFS pointers
         entry: tools/pre_commit/check_git_lfs_pointers.sh

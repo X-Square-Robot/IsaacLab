@@ -96,6 +96,42 @@ NEWTON_FORWARDED_NAMES = [
     "NewtonArticulationRootPropertiesCfg",
 ]
 
+NEWTON_FORWARDED_NAMES = [
+    "MujocoRigidBodyPropertiesCfg",
+    "MujocoJointDrivePropertiesCfg",
+    "NewtonRigidBodyPropertiesCfg",
+    "NewtonJointDrivePropertiesCfg",
+    "NewtonCollisionPropertiesCfg",
+    "NewtonMeshCollisionPropertiesCfg",
+    "NewtonSDFCollisionPropertiesCfg",
+    "NewtonMaterialPropertiesCfg",
+    "NewtonArticulationRootPropertiesCfg",
+]
+
+LOCAL_SCHEMA_NAMES = [
+    "ArticulationRootBaseCfg",
+    "BoundingCubePropertiesCfg",
+    "BoundingSpherePropertiesCfg",
+    "CollisionBaseCfg",
+    "DeformableBodyPropertiesBaseCfg",
+    "JointDriveBaseCfg",
+    "MassPropertiesCfg",
+    "MeshCollisionBaseCfg",
+    "RigidBodyBaseCfg",
+]
+
+
+@pytest.mark.parametrize("name", LOCAL_SCHEMA_NAMES)
+def test_schemas_exports_local_schema_cfg(name):
+    """``isaaclab.sim.schemas.<name>`` resolves to the local core schema cfg class."""
+    assert getattr(schemas, name) is getattr(schemas_cfg_submodule, name)
+
+
+@pytest.mark.parametrize("name", LOCAL_SCHEMA_NAMES)
+def test_sim_namespace_exports_local_schema_cfg(name):
+    """``isaaclab.sim.<name>`` resolves to the local core schema cfg class."""
+    assert getattr(sim_utils, name) is getattr(schemas_cfg_submodule, name)
+
 
 @pytest.mark.parametrize("name", FORWARDED_NAMES)
 def test_schemas_shim_resolves_to_physx_class(name):

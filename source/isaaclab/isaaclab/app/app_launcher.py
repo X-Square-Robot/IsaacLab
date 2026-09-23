@@ -24,6 +24,7 @@ import os
 import re
 import signal
 import sys
+import types
 from typing import Any, Literal
 
 try:
@@ -67,6 +68,116 @@ def _sanitize_sys_argv_for_kit(argv: list[str]) -> list[str]:
             indexes_to_remove.add(index)
 
     return [argument for index, argument in enumerate(argv) if index not in indexes_to_remove]
+
+
+def _run_simulation_lifecycle_action(action: Literal["play", "pause", "stop"]) -> bool:
+    """Run an Isaac Lab simulation lifecycle action if a simulation context exists."""
+    try:
+        from isaaclab.sim import SimulationContext
+    except ImportError as exc:
+        logger.debug("Skipping Isaac Lab toolbar action because SimulationContext is unavailable: %s", exc)
+        return False
+
+    sim = SimulationContext.instance()
+    if sim is None:
+        return False
+
+    try:
+        getattr(sim, action)()
+    except Exception as exc:
+        logger.warning("Isaac Lab toolbar action '%s' failed: %s", action, exc)
+        return False
+    return True
+
+
+def sync_toolbar_playback_controls(*, is_playing: bool, is_stopped: bool) -> None:
+    """Synchronize Kit toolbar playback controls with Isaac Lab state.
+
+    This helper is intentionally module-level so simulation backends that do not
+    drive Kit's timeline can still mirror Isaac Lab's lifecycle state into the
+    Kit toolbar. The Kit play button is a toggle button: unchecked shows the
+    play icon, checked shows the pause icon.
+    """
+    try:
+        import omni.kit.widget.toolbar
+    except ImportError as exc:
+        logger.debug("Skipping Kit toolbar playback-control sync because the toolbar module is unavailable: %s", exc)
+        return
+
+    try:
+        toolbar = omni.kit.widget.toolbar.get_instance()
+        play_button_group = toolbar._builtin_tools._play_button_group  # type: ignore[attr-defined]
+        if play_button_group is None:
+            return
+
+        play_checked = bool(is_playing and not is_stopped)
+        stop_visible = bool(not is_stopped)
+
+        play_model = getattr(play_button_group, "_timeline_play_pause_model", None)
+        if play_model is not None:
+            original_set_value = getattr(play_model, "_isaaclab_original_set_value", None)
+            if original_set_value is None and hasattr(play_model, "set_value"):
+                original_set_value = play_model.set_value
+                play_model._isaaclab_original_set_value = original_set_value
+
+            if original_set_value is not None:
+                # Route play/pause clicks and the Space hotkey to Isaac Lab's
+                # SimulationContext. If no Isaac Lab simulation exists yet, keep
+                # Kit's original timeline behavior as a fallback.
+                def _set_value(value: bool, original: Any = original_set_value) -> None:
+                    action = "play" if value else "pause"
+                    if not _run_simulation_lifecycle_action(action):
+                        original(value)
+
+                play_model.set_value = _set_value
+
+            # Keep Kit's private play/pause model in lockstep so the ToolButton
+            # renders the pause glyph while Isaac Lab is running even when the
+            # active physics backend does not advance Kit's own timeline.
+            if hasattr(play_model, "_is_playing"):
+                play_model._is_playing = is_playing
+            if hasattr(play_model, "_is_stopped"):
+                play_model._is_stopped = is_stopped
+            value_changed = getattr(play_model, "_value_changed", None)
+            if callable(value_changed):
+                value_changed()
+
+        play_button = play_button_group._play_button  # type: ignore[attr-defined]
+        if play_button is not None:
+            play_button.visible = True
+            play_button.enabled = True
+            play_button.checked = play_checked
+            hotkey = "Space"
+            play_hotkey = getattr(play_button_group, "_play_hotkey", None)
+            if play_hotkey is not None:
+                hotkey = play_hotkey.get_as_string("Space")
+            tooltip = "Pause" if play_checked else "Play"
+            if hasattr(play_button, "set_tooltip"):
+                play_button.set_tooltip(f"{tooltip} ({hotkey})")
+            else:
+                play_button.tooltip = f"{tooltip} ({hotkey})"
+
+        stop_button = play_button_group._stop_button  # type: ignore[attr-defined]
+        if stop_button is not None:
+            stop_button.visible = stop_visible
+            stop_button.enabled = stop_visible
+            if hasattr(stop_button, "set_clicked_fn"):
+                # Route stop clicks to Isaac Lab's state machine. If the
+                # SimulationContext is not ready, fall back to Kit's timeline
+                # stop command so the toolbar remains useful during startup.
+                def _stop_clicked() -> None:
+                    if _run_simulation_lifecycle_action("stop"):
+                        return
+                    try:
+                        import omni.kit.commands
+
+                        omni.kit.commands.execute("ToolbarStopButtonClicked")
+                    except ImportError as exc:
+                        logger.debug("Skipping Kit toolbar stop fallback because commands are unavailable: %s", exc)
+
+                stop_button.set_clicked_fn(_stop_clicked)
+    except AttributeError as exc:
+        logger.debug("Skipping Kit toolbar playback-control sync because the toolbar layout is unavailable: %s", exc)
 
 
 class ExplicitAction(argparse.Action):
@@ -322,30 +433,13 @@ class AppLauncher:
 
         _deprioritize_prebundle_paths()
 
-        # Hide the stop button in the toolbar
-        self._hide_stop_button()
         # Set animation recording settings
         self._set_animation_recording_settings(launcher_args)
         # Set visualizer settings (if requested)
         self._set_visualizer_settings(launcher_args)
 
-        # Hide play button callback if the timeline is stopped
-        import omni.timeline
-
-        self._hide_play_button_callback = (
-            omni.timeline.get_timeline_interface()
-            .get_timeline_event_stream()
-            .create_subscription_to_pop_by_type(
-                int(omni.timeline.TimelineEventType.STOP), lambda e: self._hide_play_button(True)
-            )
-        )
-        self._unhide_play_button_callback = (
-            omni.timeline.get_timeline_interface()
-            .get_timeline_event_stream()
-            .create_subscription_to_pop_by_type(
-                int(omni.timeline.TimelineEventType.PLAY), lambda e: self._hide_play_button(False)
-            )
-        )
+        # Keep playback controls in sync with timeline state for GUI-driven changes.
+        self._subscribe_playback_control_timeline_callbacks()
         # Report this process's lifecycle to whatever supervises it: the CI runner watches
         # the startup announcements, and distributed launchers/schedulers/CI read the exit
         # status. See the class docstring of :class:`_SimulationAppLifecycle` for the full
@@ -1254,6 +1348,14 @@ class AppLauncher:
         # enable sys stdout and stderr
         sys.stdout = sys.__stdout__
 
+        # Kit extensions freshly re-imported some Isaac Lab modules while they were hidden above.
+        # Drop those duplicates before restoring the originals: keeping both worlds in sys.modules
+        # mixes two copies of every cfg class and breaks isinstance checks across them (e.g. a
+        # GroundPlaneCfg default material built from duplicate base classes). Non-module entries
+        # (e.g. the settings-manager singleton) are deliberately kept.
+        for key in list(sys.modules.keys()):
+            if r.match(key) and key not in hacked_modules and isinstance(sys.modules[key], types.ModuleType):
+                del sys.modules[key]
         # add Isaac Lab modules back to sys.modules
         for key, value in hacked_modules.items():
             sys.modules[key] = value
@@ -1326,25 +1428,6 @@ class AppLauncher:
         # use fixed time stepping disabled; custom loop runner from Isaac Sim is used instead
         settings.set_bool("/app/player/useFixedTimeStepping", False)
 
-    def _hide_stop_button(self):
-        """Hide the stop button in the toolbar.
-
-        For standalone executions, having a stop button is confusing since it invalidates the whole simulation.
-        Thus, we hide the button so that users don't accidentally click it.
-        """
-        # when we are truly headless, then we can't import the widget toolbar
-        # thus, we only hide the stop button when we are not headless (i.e. GUI is enabled)
-        if self._livestream >= 1 or not self._headless:
-            import omni.kit.widget.toolbar
-
-            # grey out the stop button because we don't want to stop the simulation manually in standalone mode
-            toolbar = omni.kit.widget.toolbar.get_instance()
-            play_button_group = toolbar._builtin_tools._play_button_group  # type: ignore
-            if play_button_group is not None:
-                play_button_group._stop_button.visible = False  # type: ignore
-                play_button_group._stop_button.enabled = False  # type: ignore
-                play_button_group._stop_button = None  # type: ignore
-
     def _set_animation_recording_settings(self, launcher_args: dict) -> None:
         """Store animation recording settings in settings."""
         recording_enabled = launcher_args.get("anim_recording_enabled", False)
@@ -1378,8 +1461,27 @@ class AppLauncher:
 
     def is_isaac_sim_version_5(self) -> bool:
         if not hasattr(self, "_is_sim_ver_5"):
-            # 1) Try to read the VERSION file (for manual / binary installs)
-            version_path = os.path.abspath(os.path.join(os.path.dirname(isaacsim.__file__), "../../VERSION"))
+            # 1) Try to read the VERSION file (for manual / binary installs).
+            #    The module-level ``import isaacsim`` is wrapped in
+            #    ``contextlib.suppress(ModuleNotFoundError)``, so on an
+            #    environment where Isaac Sim is not importable the global is
+            #    simply absent and dereferencing it raised an opaque
+            #    ``NameError: name 'isaacsim' is not defined`` from deep inside
+            #    experience-file resolution. Re-import locally and report the
+            #    actual problem instead.
+            try:
+                import isaacsim as _isaacsim_for_version
+            except ImportError as exc:
+                raise ImportError(
+                    "Isaac Sim is required to launch the simulator but the 'isaacsim' package is not"
+                    " importable. Install Isaac Sim (`pip install isaacsim` or the binary"
+                    " distribution), or activate the environment that provides it — a stripped"
+                    " PYTHONPATH / LD_LIBRARY_PATH is a common cause."
+                ) from exc
+
+            version_path = os.path.abspath(
+                os.path.join(os.path.dirname(_isaacsim_for_version.__file__), "../../VERSION")
+            )
             if os.path.isfile(version_path):
                 with open(version_path) as f:
                     ver = f.readline().strip()
@@ -1400,22 +1502,38 @@ class AppLauncher:
                 self._is_sim_ver_5 = False
         return self._is_sim_ver_5
 
-    def _hide_play_button(self, flag):
-        """Hide/Unhide the play button in the toolbar.
+    @staticmethod
+    def _playback_state_from_timeline(timeline: Any) -> tuple[bool, bool]:
+        """Return ``(is_playing, is_stopped)`` from *timeline*."""
+        return bool(timeline.is_playing()), bool(timeline.is_stopped())
 
-        This is used if the timeline is stopped by a GUI action like "save as" to not allow the user to
-        resume the timeline afterwards.
-        """
-        # when we are truly headless, then we can't import the widget toolbar
-        # thus, we only hide the play button when we are not headless (i.e. GUI is enabled)
+    def _subscribe_playback_control_timeline_callbacks(self) -> None:
+        """Subscribe toolbar playback-control synchronization to timeline state changes."""
+        import omni.timeline
+
+        event_stream = omni.timeline.get_timeline_interface().get_timeline_event_stream()
+        self._play_button_stop_callback = event_stream.create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.STOP), lambda e: self._sync_playback_controls_from_timeline()
+        )
+        self._play_button_play_callback = event_stream.create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.PLAY), lambda e: self._sync_playback_controls_from_timeline()
+        )
+        self._play_button_pause_callback = event_stream.create_subscription_to_pop_by_type(
+            int(omni.timeline.TimelineEventType.PAUSE), lambda e: self._sync_playback_controls_from_timeline()
+        )
+
+    def _sync_playback_controls_from_timeline(self) -> None:
+        """Update toolbar playback controls from the current timeline state."""
+        import omni.timeline
+
+        timeline = omni.timeline.get_timeline_interface()
+        is_playing, is_stopped = self._playback_state_from_timeline(timeline)
+        self._sync_playback_controls(is_playing=is_playing, is_stopped=is_stopped)
+
+    def _sync_playback_controls(self, *, is_playing: bool, is_stopped: bool) -> None:
+        """Update Kit toolbar playback controls when a visible toolbar exists."""
         if self._livestream >= 1 or not self._headless:
-            import omni.kit.widget.toolbar
-
-            toolbar = omni.kit.widget.toolbar.get_instance()
-            play_button_group = toolbar._builtin_tools._play_button_group  # type: ignore
-            if play_button_group is not None:
-                play_button_group._play_button.visible = not flag  # type: ignore
-                play_button_group._play_button.enabled = not flag  # type: ignore
+            sync_toolbar_playback_controls(is_playing=is_playing, is_stopped=is_stopped)
 
     class _SimulationAppLifecycle:
         """Reports the lifecycle of the Kit-based :class:`SimulationApp` process.

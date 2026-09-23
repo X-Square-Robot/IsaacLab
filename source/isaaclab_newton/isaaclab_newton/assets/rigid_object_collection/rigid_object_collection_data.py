@@ -73,8 +73,7 @@ class RigidObjectCollectionData(BaseRigidObjectCollectionData):
 
         # Bind ``GRAVITY_VEC_W`` to Newton's per-env ``model.gravity`` (m/s^2); the
         # projected_gravity_b kernel broadcasts each env's vector across its bodies.
-        # The final entry is reserved for Newton's global world and is not an
-        # Isaac Lab environment.
+        # Limit the live view to entries associated with Isaac Lab environments.
         model = SimulationManager.get_model()
         self.GRAVITY_VEC_W = ProxyArray(model.gravity[: model.world_count])
         forward_vec = np.full((self.num_instances, self.num_bodies, 3), (1.0, 0.0, 0.0), dtype=np.float32)

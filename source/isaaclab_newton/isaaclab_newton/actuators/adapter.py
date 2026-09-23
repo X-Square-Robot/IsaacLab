@@ -17,7 +17,7 @@ to controller arrays.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -148,7 +148,7 @@ class NewtonActuatorAdapter:
                 Newton ``State`` on the Newton backend,
                 :class:`~isaaclab_newton.actuators.physx_wrapper.PhysxActuatorWrapper`
                 on the PhysX backend.
-            sim_control: Object with ``joint_f``, ``joint_target_pos``, etc.
+            sim_control: Object with ``joint_f``, ``joint_target_q``, etc.
                 Newton ``Control`` on the Newton backend,
                 :class:`~isaaclab_newton.actuators.physx_wrapper.PhysxActuatorWrapper`
                 on the PhysX backend.
@@ -161,6 +161,7 @@ class NewtonActuatorAdapter:
                 zero_at_indices_kernel,
                 dim=act.indices.shape[0],
                 inputs=[sim_control.joint_f, act.indices],
+                device=self._device,
             )
         for act, sa, sb in zip(self.actuators, self._states_a, self._states_b):
             act.step(sim_state, sim_control, sa, sb, dt=dt)
@@ -276,6 +277,69 @@ class NewtonActuatorAdapter:
     def is_all_graphable(self) -> bool:
         """``True`` when all actuators are CUDA-graph-safe."""
         return len(self.actuators) > 0 and all(a.is_graphable() for a in self.actuators)
+
+    def stable_pd_actuator_slices(
+        self,
+        dof_offset: int,
+        num_joints: int,
+    ) -> list[tuple[int, list[int]]]:
+        """Locate ``ControllerStablePD`` actuators owned by one articulation.
+
+        Filters :attr:`actuators` to those whose controller is a
+        :class:`newton.actuators.ControllerStablePD` and whose env-0 DOFs fall
+        within ``[dof_offset, dof_offset + num_joints)``, returning enough to
+        slice the per-actuator mass-matrix block each step (see
+        :meth:`current_controller_state`).
+
+        Args:
+            dof_offset: Offset of this articulation's DOFs in the env-major
+                global index space (``0`` on PhysX, view-dependent on Newton).
+            num_joints: Articulation-local joint count.
+
+        Returns:
+            List of ``(actuator_index, local_joint_indices)`` tuples, one per
+            matching actuator. ``actuator_index`` indexes :attr:`actuators` (and
+            the swapped state lists); ``local_joint_indices`` are the env-0
+            articulation-local joint columns the actuator covers, in the
+            actuator's own DOF order (the order its ``kp``/``kd`` use). Empty
+            when Newton lacks ``ControllerStablePD`` or none match.
+        """
+        try:
+            from newton.actuators import ControllerStablePD  # noqa: PLC0415
+        except ImportError:
+            return []
+
+        result: list[tuple[int, list[int]]] = []
+        for act_idx, act in enumerate(self.actuators):
+            if not isinstance(act.controller, ControllerStablePD):
+                continue
+            all_indices = act.indices.numpy()
+            num_per_act = len(all_indices) // self._num_envs
+            local_joints = [int(g) - dof_offset for g in all_indices[:num_per_act]]
+            if any(j < 0 or j >= num_joints for j in local_joints):
+                continue
+            result.append((act_idx, local_joints))
+        return result
+
+    def current_controller_state(self, actuator_index: int) -> Any:
+        """Return the controller state the next :meth:`step` will read.
+
+        The adapter double-buffers actuator state and swaps after each
+        :meth:`step`, so the "current" (about-to-be-read) state is always
+        ``_states_a[actuator_index]``. Pre-actuator hooks that populate
+        controller inputs (e.g. the ``ControllerStablePD`` mass matrix) must
+        write into this state, and must re-fetch it every step because the
+        underlying list is reassigned on swap.
+
+        Args:
+            actuator_index: Index into :attr:`actuators`.
+
+        Returns:
+            The current :class:`newton.actuators.Actuator.State`'s
+            ``controller_state`` (``None`` for stateless controllers).
+        """
+        state = self._states_a[actuator_index]
+        return state.controller_state if state is not None else None
 
     @classmethod
     def from_usd(
@@ -453,6 +517,60 @@ def build_newton_actuator_defaults(
 # ---------------------------------------------------------------------------
 
 
+def resolve_stable_pd_gravity_modes(
+    stable_pd_slices: list[tuple[int, list[int]]],
+    actuator_cfgs: dict[str, Any],
+    find_joints: Callable[..., tuple[list[int], list[str]]],
+) -> list[str]:
+    """Map each StablePD actuator slice to its cfg group's ``gravity_compensation`` mode.
+
+    Newton merges actuator groups with identical controller parameters into one
+    ``ControllerStablePD``, so a slice may span joints from several IsaacLab actuator
+    groups. Every group feeding one slice must agree on the mode.
+
+    Args:
+        stable_pd_slices: ``(actuator_index, local_joint_indices)`` per StablePD actuator,
+            as returned by :meth:`NewtonActuatorAdapter.stable_pd_actuator_slices`.
+        actuator_cfgs: The articulation cfg's actuator-group dict. Groups without a
+            ``gravity_compensation`` field (non-StablePD cfgs) are ignored.
+        find_joints: The articulation's ``find_joints`` resolver (joint expression →
+            local joint ids).
+
+    Returns:
+        One mode string per slice, aligned with ``stable_pd_slices``. Slices not covered
+        by any StablePD cfg group default to ``"bias"``.
+
+    Raises:
+        ValueError: When a cfg group carries an unknown mode, or when groups merged into
+            one controller disagree on the mode.
+    """
+    joint_owner: dict[int, tuple[str, str]] = {}
+    for name, cfg in actuator_cfgs.items():
+        mode = getattr(cfg, "gravity_compensation", None)
+        if mode is None:
+            continue
+        if mode not in ("bias", "feedforward", "none"):
+            raise ValueError(
+                f"actuator group {name!r}: gravity_compensation must be 'bias', 'feedforward' or 'none', got {mode!r}"
+            )
+        joint_ids, _ = find_joints(cfg.joint_names_expr)
+        for j in joint_ids:
+            joint_owner[int(j)] = (name, mode)
+
+    modes: list[str] = []
+    for _, local_joints in stable_pd_slices:
+        owners = {joint_owner[j] for j in local_joints if j in joint_owner}
+        unique = {m for _, m in owners}
+        if len(unique) > 1:
+            groups = sorted(n for n, _ in owners)
+            raise ValueError(
+                "actuator groups merged into one ControllerStablePD disagree on"
+                f" gravity_compensation: {groups}. Use identical settings or distinct gains."
+            )
+        modes.append(unique.pop() if unique else "bias")
+    return modes
+
+
 def _actuator_signature(parsed: Any) -> tuple:
     """Build a hashable key from a parsed actuator spec for grouping.
 
@@ -554,6 +672,12 @@ def _create_actuators_from_usd(
         ctrl_kwargs = dict(parsed.controller_kwargs)
         resolved = parsed.controller_class.resolve_arguments(ctrl_kwargs)
         shared_ctrl = getattr(parsed.controller_class, "SHARED_PARAMS", set())
+        if "num_worlds" in shared_ctrl:
+            # Per-world blocked controllers (ControllerStablePD) solve one
+            # n_per_world block per env; USD authoring carries no env count, so
+            # wire the replicated view's env count in here. flat_indices below
+            # are env-major, matching the controller's world-major layout.
+            resolved["num_worlds"] = num_envs
         ctrl_arrays = {}
         for key, val in resolved.items():
             if key in shared_ctrl:

@@ -85,7 +85,7 @@ class SimulationCfg:
     """
 
     use_newton_actuators: bool = False
-    """Use Newton-native actuators instead of IsaacLab explicit actuator models.
+    """Enable the Newton-native actuator capability for this simulation.
 
     When ``True``, explicit actuator configs (e.g. :class:`IdealPDActuatorCfg`,
     :class:`DCMotorCfg`) are translated into ``NewtonActuator`` USD prims and
@@ -98,6 +98,28 @@ class SimulationCfg:
     :class:`ImplicitActuatorCfg` entries are still instantiated normally and
     their gains are written to the simulation, so joints that use implicit
     actuation continue to work as expected.
+
+    Individual :class:`~isaaclab.assets.ArticulationCfg` instances may opt out
+    with :attr:`~isaaclab.assets.ArticulationCfg.native_actuators=False` or
+    override the inherited choice with ``True``. This field remains global
+    because the backend and its USD schema extension are initialized once per
+    simulation; the articulation field selects which assets consume them.
+    """
+
+    newton_actuator_device: str | None = None
+    """Optional device for Newton-native actuators on the PhysX backend.
+
+    ``None`` keeps actuator computation on :attr:`device`. A distinct CUDA
+    device enables the explicit PhysX CPU to CUDA-controller staging bridge.
+    Newton physics backends ignore this field because their actuators execute
+    inside the solver graph.
+    """
+
+    newton_actuator_cuda_graph: bool | None = None
+    """Override CUDA Graph capture for PhysX-hosted Newton actuators.
+
+    ``None`` preserves the existing automatic behavior (capture on CUDA when
+    every actuator is graph-safe).
     """
 
     physics: PhysicsCfg | None = None

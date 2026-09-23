@@ -5,7 +5,12 @@
 
 from dataclasses import MISSING
 
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonCollisionPipelineCfg, NewtonShapeCfg
+from isaaclab_newton.physics import (
+    MJWarpSolverCfg,
+    NewtonCfg,
+    NewtonCollisionPipelineCfg,
+    NewtonShapeCfg,
+)
 from isaaclab_physx.physics import PhysxCfg
 
 import isaaclab.sim as sim_utils
@@ -414,6 +419,30 @@ class EventCfg:
 @configclass
 class ActionsCfg:
     pass
+
+
+@configclass
+class _LiftNewtonEventCfg:
+    """Newton-compatible events: excludes material randomization (not supported in Newton)."""
+
+    reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+
+    reset_object_position = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0.25), "z": (0.0, 0.0)},
+            "velocity_range": {},
+            "asset_cfg": SceneEntityCfg("object", body_names="Object"),
+        },
+    )
+
+
+@configclass
+class LiftEventCfg(PresetCfg):
+    default: EventCfg = EventCfg()
+    physx: EventCfg = EventCfg()
+    newton: _LiftNewtonEventCfg = _LiftNewtonEventCfg()
 
 
 @configclass

@@ -120,6 +120,40 @@ class MJWarpSolverCfg(NewtonSolverCfg):
     Newton default is ``1e-6``.
     """
 
+    min_friction: float = 2e-5
+    """Minimum sliding friction coefficient applied to all geoms.
+
+    MuJoCo's constraint solver divides by the friction coefficient when
+    ``condim >= 3``.  A zero value produces NaN forces that destabilize the
+    simulation.  This clamp is applied to ``model.shape_material_mu`` before
+    the solver is constructed.  Set to ``0.0`` to disable clamping.
+    """
+
+    contact_ke: float | None = None
+    """Optional contact stiffness override applied to all MuJoCo geoms.
+
+    This is a solver-side stabilization knob for dense imported robot meshes.
+    When set, the value is written into Newton's per-shape contact stiffness
+    array before :class:`newton.solvers.SolverMuJoCo` builds its MuJoCo model.
+    Leave as ``None`` to preserve USD/default shape values.
+    """
+
+    contact_kd: float | None = None
+    """Optional contact damping override applied to all MuJoCo geoms.
+
+    This should normally be tuned together with :attr:`contact_ke` so the
+    generated MuJoCo ``solref`` stays in a soft, well-damped range for dense
+    mesh contacts.
+    """
+
+    contact_condim: int | None = None
+    """Optional MuJoCo contact dimensionality override for all geoms.
+
+    ``1`` keeps only the normal contact constraint and is useful for isolating
+    position-control stability from dense self-contact friction constraints.
+    Leave as ``None`` to use per-geom USD/default MuJoCo values.
+    """
+
     def __post_init__(self):
         if self.ls_parallel:
             warnings.warn(

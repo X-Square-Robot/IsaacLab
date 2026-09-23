@@ -48,6 +48,16 @@ class NewtonCoupledMJWarpVBDManager(NewtonVBDManager):
         super().step()
 
     @classmethod
+    def _solver_specific_clear(cls):
+        """Clear VBD-specific state and drop coupled sub-solver references."""
+        super()._solver_specific_clear()
+        # Base clear() only resets NewtonManager._solver; without this the class
+        # attributes keep the destroyed solvers (and their GPU memory) alive.
+        cls._rigid_solver = None
+        cls._soft_solver = None
+        cls._coupling_mode = None
+
+    @classmethod
     def _build_solver(cls, model: Model, solver_cfg: CoupledMJWarpVBDSolverCfg) -> None:
         """Construct the coupled solvers and populate the base lifecycle slots.
 

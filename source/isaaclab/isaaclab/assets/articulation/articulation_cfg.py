@@ -104,6 +104,32 @@ class ArticulationCfg(AssetBaseCfg):
     actuators: dict[str, ActuatorBaseCfg] = MISSING
     """Actuators for the robot with corresponding joint names."""
 
+    native_actuators: bool | None = None
+    """Whether this articulation opts into Newton-native actuator execution.
+
+    ``None`` inherits :attr:`~isaaclab.sim.SimulationCfg.use_newton_actuators`,
+    preserving the simulation-wide behavior used by existing configurations.
+    ``True`` opts this articulation in when the simulation has enabled the
+    Newton actuator capability; ``False`` keeps it on the standard Isaac Lab
+    actuator path. The capability flag remains global because the physics
+    backend and USD schema extension are initialized once per simulation.
+    """
+
+    newton_actuator_device: str | None = None
+    """Device for this articulation's PhysX-hosted Newton actuator work.
+
+    ``None`` inherits :attr:`~isaaclab.sim.SimulationCfg.newton_actuator_device`.
+    The setting is ignored when :attr:`native_actuators` resolves to ``False``
+    and by Newton physics backends whose actuator work runs in the solver.
+    """
+
+    newton_actuator_cuda_graph: bool | None = None
+    """Whether to capture this articulation's PhysX Newton actuator work in CUDA Graphs.
+
+    ``None`` inherits :attr:`~isaaclab.sim.SimulationCfg.newton_actuator_cuda_graph`.
+    The setting is ignored when :attr:`native_actuators` resolves to ``False``.
+    """
+
     actuator_value_resolution_debug_print = False
     """Print the resolution of actuator final value when input cfg is different from USD value, Defaults to False
     """
@@ -113,9 +139,8 @@ class ArticulationCfg(AssetBaseCfg):
 
         Invoked by :class:`~isaaclab.assets.AssetBase` once the articulation's prims
         exist on the stage. Delegates to
-        :func:`~isaaclab.sim.schemas.define_actuator_properties`, which gates itself
-        on ``sim_cfg.use_newton_actuators`` and silently no-ops when the simulation
-        is not configured for Newton-native actuators.
+        :func:`~isaaclab.sim.schemas.define_actuator_properties` with this
+        articulation's resolved native-actuator selection.
         """
         if self.actuators is MISSING:
             return
@@ -128,4 +153,42 @@ class ArticulationCfg(AssetBaseCfg):
         author_prim_path = (
             self.spawn.spawn_path if self.spawn is not None and self.spawn.spawn_path is not None else self.prim_path
         )
-        define_actuator_properties(author_prim_path, self.actuators, stage=stage)
+        use_newton_actuators, _, _ = self.resolve_newton_actuator_settings()
+        define_actuator_properties(
+            author_prim_path,
+            self.actuators,
+            stage=stage,
+            use_newton_actuators=use_newton_actuators,
+        )
+
+    def resolve_newton_actuator_settings(self, sim_cfg: Any | None = None) -> tuple[bool, str | None, bool | None]:
+        """Resolve simulation capability and per-articulation Newton settings.
+
+        Args:
+            sim_cfg: Optional resolved simulation configuration. When omitted,
+                the active :class:`~isaaclab.sim.SimulationContext` is queried.
+
+        Returns:
+            A tuple ``(enabled, device, cuda_graph)``. ``enabled`` is false
+            when the simulation-level Newton actuator capability is off; the
+            device and graph values inherit from the simulation configuration
+            unless overridden on this articulation.
+        """
+        if sim_cfg is None:
+            from isaaclab.sim import SimulationContext  # noqa: PLC0415
+
+            sim_context = SimulationContext.instance()
+            sim_cfg = sim_context.cfg if sim_context is not None else None
+
+        capability_enabled = bool(getattr(sim_cfg, "use_newton_actuators", False))
+        enabled = capability_enabled and self.native_actuators is not False
+        if not enabled:
+            return False, None, None
+
+        device = self.newton_actuator_device
+        if device is None:
+            device = getattr(sim_cfg, "newton_actuator_device", None)
+        cuda_graph = self.newton_actuator_cuda_graph
+        if cuda_graph is None:
+            cuda_graph = getattr(sim_cfg, "newton_actuator_cuda_graph", None)
+        return True, device, cuda_graph

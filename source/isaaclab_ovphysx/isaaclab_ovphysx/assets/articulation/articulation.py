@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import warnings
@@ -54,6 +55,8 @@ from .kernels import (
 
 # import logger
 logger = logging.getLogger(__name__)
+
+_HAS_NEWTON_ACTUATORS = importlib.util.find_spec("isaaclab_newton.actuators") is not None
 
 
 class Articulation(BaseArticulation):
@@ -220,6 +223,9 @@ class Articulation(BaseArticulation):
         # reset external wrenches.
         self._instantaneous_wrench_composer.reset(env_ids, env_mask)
         self._permanent_wrench_composer.reset(env_ids, env_mask)
+        # reset Newton actuator states (delay queues, controller internals)
+        if getattr(self, "_has_newton_actuators", False) and self.newton_actuator_adapter is not None:
+            self.newton_actuator_adapter.reset(env_ids)
 
     def write_data_to_sim(self) -> None:
         """Write external wrenches and joint commands to the simulation.
@@ -263,7 +269,12 @@ class Articulation(BaseArticulation):
                 inst.reset()
 
         # apply actuator models
-        self._apply_actuator_model()
+        if getattr(self, "_has_newton_actuators", False):
+            # Newton fast path computes the public-order applied torque buffer;
+            # the ordering-aware write below gathers it into backend order.
+            self._apply_actuator_model_newton()
+        else:
+            self._apply_actuator_model()
         # write actions into simulation (zeros are safe when no actuators are active).
         # ``_applied_torque`` is the actuator-computed output (may differ from the raw
         # commanded target, e.g. once clipped), so it must be reordered into its own
@@ -4504,6 +4515,10 @@ class Articulation(BaseArticulation):
 
         self.actuators: dict[str, Any] = {}
         self._has_implicit_actuators = False
+        self._has_newton_actuators = False
+        self.newton_actuator_adapter = None
+        self._ovphysx_actuator_wrapper = None
+        self._implicit_dof_mask: wp.array | None = None
         for name, act_cfg in self.cfg.actuators.items():
             joint_ids, joint_names = self.find_joints(act_cfg.joint_names_expr, as_proxy=True)
             if not joint_names:
@@ -4550,6 +4565,142 @@ class Articulation(BaseArticulation):
             self.write_joint_damping_to_sim_index(damping=damping, joint_ids=actuator_joint_ids)
             self.write_joint_effort_limit_to_sim_index(limits=act.effort_limit_sim, joint_ids=actuator_joint_ids)
             self.write_joint_velocity_limit_to_sim_index(limits=act.velocity_limit_sim, joint_ids=actuator_joint_ids)
+
+        self._setup_newton_actuator_fast_path()
+
+    def _setup_newton_actuator_fast_path(self) -> None:
+        """Wire the resolved Newton actuator fast path for this articulation.
+
+        Mirrors the PhysX backend: a :class:`PhysxActuatorWrapper` provides the flat
+        ``sim_state``/``sim_control`` buffer views the Newton actuator protocol expects,
+        a :class:`NewtonActuatorAdapter` is built from the ``NewtonActuator`` USD prims
+        authored at spawn time, and StablePD controllers get their per-step mass matrix
+        and RNEA bias fed from the wheel's inverse-dynamics bindings
+        (:attr:`TT.MASS_MATRIX` / :attr:`TT.CORIOLIS` / :attr:`TT.GRAVITY_FORCE`).
+
+        No-op unless the simulation cfg enables the Newton actuator capability,
+        this articulation opts into it, and the ``isaaclab_newton.actuators``
+        extension is importable.
+        """
+        from isaaclab.actuators import ImplicitActuator
+
+        sim_cfg = getattr(PhysicsManager._sim, "cfg", None)
+        resolve_actuator_settings = getattr(self.cfg, "resolve_newton_actuator_settings", None)
+        if callable(resolve_actuator_settings):
+            use_newton_actuators, _, _ = resolve_actuator_settings(sim_cfg)
+        else:
+            # Compatibility for custom articulation cfg classes from older
+            # Isaac Lab releases that do not expose the per-articulation API.
+            use_newton_actuators = getattr(sim_cfg, "use_newton_actuators", False)
+        if use_newton_actuators and not _HAS_NEWTON_ACTUATORS:
+            logger.warning(
+                "use_newton_actuators is enabled but 'isaaclab_newton.actuators' is not available."
+                " Newton-native actuators will be disabled and the simulation will fall back to the"
+                " Isaac Lab actuator path. Install the isaaclab_newton extension to enable the fast path."
+            )
+        if not (use_newton_actuators and _HAS_NEWTON_ACTUATORS):
+            return
+
+        from isaaclab_newton.actuators import (  # noqa: PLC0415
+            NewtonActuatorAdapter,
+            PhysxActuatorWrapper,
+            build_implicit_dof_mask,
+            resolve_stable_pd_gravity_modes,
+        )
+
+        self._has_newton_actuators = True
+        # Always allocate the wrapper so ``_apply_actuator_model_newton`` has a
+        # ``joint_f_2d`` buffer to merge effort into, even when all groups are implicit.
+        self._ovphysx_actuator_wrapper = PhysxActuatorWrapper.create(
+            num_envs=self._num_instances,
+            num_joints=self._num_joints,
+            device=self._device,
+        )
+
+        has_explicit = any(not isinstance(act, ImplicitActuator) for act in self.actuators.values())
+        if has_explicit:
+            stage = PhysicsManager._sim.stage
+            first_prim = sim_utils.find_first_matching_prim(self.cfg.prim_path, stage=stage)
+            art_prim_path = str(first_prim.GetPath()) if first_prim is not None else None
+            adapter = NewtonActuatorAdapter.from_usd(
+                stage=stage,
+                joint_names=self.joint_names,
+                num_envs=self._num_instances,
+                num_joints=self._num_joints,
+                device=self._device,
+                articulation_prim_path=art_prim_path,
+            )
+            # Bind the wrapper's flat aliases of state/input buffers once. The underlying
+            # wp.arrays are the data container's persistent staging buffers, whose device
+            # pointers are fixed for the articulation's lifetime.
+            w = self._ovphysx_actuator_wrapper
+            w.joint_q = self._data.joint_pos.warp.reshape(-1)
+            w.joint_qd = self._data.joint_vel.warp.reshape(-1)
+            w.joint_target_q = self._data.joint_pos_target.warp.reshape(-1)
+            w.joint_target_qd = self._data.joint_vel_target.warp.reshape(-1)
+            w.joint_act = self._data.joint_effort_target.warp.reshape(-1)
+            adapter.finalize(w)
+            self.newton_actuator_adapter = adapter
+
+            # ControllerStablePD reads State.mass_matrix each step; cache the joint
+            # slices and read buffers so _feed_stable_pd_mass_matrix can populate it.
+            self._stable_pd_slices = adapter.stable_pd_actuator_slices(0, self._num_joints)
+            if self._stable_pd_slices:
+                if not self._is_fixed_base:
+                    raise NotImplementedError(
+                        "StablePD on the OvPhysX backend currently supports fixed-base articulations"
+                        " only: the wheel's root-DOF layout for floating-base mass matrices is"
+                        " unverified, so the Schur elimination of the base block is not wired."
+                    )
+                # Fixed base: the wheel reports pure joint-space quantities
+                # (MASS_MATRIX [N, D, D]; CORIOLIS/GRAVITY_FORCE [N, D]).
+                for tt in (TT.MASS_MATRIX, TT.CORIOLIS, TT.GRAVITY_FORCE):
+                    if self._root_view.try_binding_for(tt) is None:
+                        raise RuntimeError(f"OvPhysX could not create the {tt!r} binding required by StablePD.")
+                # ``get_attribute`` allocates on the binding's native device with the
+                # binding's shape; the buffers are then refilled in place each step.
+                self._spd_mass_buf = self._root_view.get_attribute(TT.MASS_MATRIX)
+                self._spd_coriolis_buf = self._root_view.get_attribute(TT.CORIOLIS)
+                self._spd_gravity_buf = self._root_view.get_attribute(TT.GRAVITY_FORCE)
+                self._stable_pd_local_joint_tensors = [
+                    torch.tensor(local_joints, dtype=torch.long, device=self._device)
+                    for _, local_joints in self._stable_pd_slices
+                ]
+                self._stable_pd_backend_joint_tensors = [
+                    torch.tensor(self.map_joint_ids_to_backend(local_joints), dtype=torch.long, device=self._device)
+                    for _, local_joints in self._stable_pd_slices
+                ]
+                # Gravity handling per StablePDActuatorCfg.gravity_compensation; a
+                # gravity-disabled robot forces "none" (the wheel computes g(q) from
+                # scene gravity regardless of the per-body flag -- phantom load).
+                rigid_props = getattr(getattr(self.cfg, "spawn", None), "rigid_props", None)
+                self._stable_pd_gravity_on = not getattr(rigid_props, "disable_gravity", False)
+                modes = resolve_stable_pd_gravity_modes(self._stable_pd_slices, self.cfg.actuators, self.find_joints)
+                if not self._stable_pd_gravity_on:
+                    modes = ["none"] * len(modes)
+                self._stable_pd_gravity_modes = modes
+                self._stable_pd_const_efforts: list[wp.array | None] = []
+                for (act_idx, _), mode in zip(self._stable_pd_slices, modes):
+                    ctrl = adapter.actuators[act_idx].controller
+                    if mode == "feedforward" and ctrl.const_effort is None:
+                        ctrl.const_effort = wp.zeros_like(ctrl.kp)
+                    self._stable_pd_const_efforts.append(ctrl.const_effort if mode == "feedforward" else None)
+
+        # Per-DOF implicit/explicit mask consumed by the sync_torque_telemetry kernel.
+        # Keep the owning torch tensor alive as an instance attribute.
+        self._implicit_dof_mask, self._implicit_dof_mask_owner = build_implicit_dof_mask(
+            self.actuators,
+            self._num_joints,
+            self._device,
+        )
+        if self.newton_actuator_adapter is not None:
+            self._data._sim_bind_joint_computed_effort = self.newton_actuator_adapter.computed_effort_2d
+        else:
+            self._data._sim_bind_joint_computed_effort = wp.zeros(
+                (self._num_instances, self._num_joints),
+                dtype=wp.float32,
+                device=self._device,
+            )
 
     def _apply_actuator_model(self) -> None:
         """Run the actuator model to compute joint torques from user-supplied targets.
@@ -4598,6 +4749,124 @@ class Articulation(BaseArticulation):
                 else:
                     ct[:, torch_joint_ids] = act.computed_effort
                     at[:, torch_joint_ids] = act.applied_effort
+
+    def _apply_actuator_model_newton(self) -> None:
+        """Pre-fill effort buffer with FF, step Newton actuators, sync telemetry.
+
+        Mirrors the PhysX backend: pre-fills ``joint_f_2d`` with the user's effort
+        target across all DOFs, feeds StablePD controllers their mass matrix and
+        bias, then ``newton_actuator_adapter.step`` overwrites the explicit DOFs
+        with each actuator's computed effort while implicit DOFs keep the FF. The
+        :func:`sync_torque_telemetry` kernel fills ``_computed_torque`` /
+        ``_applied_torque`` from the resulting buffer, and
+        :meth:`write_data_to_sim` pushes it as the actuation force.
+        """
+        from isaaclab_newton.actuators import kernels as actuator_kernels  # noqa: PLC0415
+
+        w = self._ovphysx_actuator_wrapper
+        w.joint_f_2d.assign(self._data._joint_effort_target)
+        self._feed_stable_pd_mass_matrix()
+        if self.newton_actuator_adapter is not None:
+            if self.data.has_joint_ordering:
+                # The wrapper aliases public-order shadow buffers. Refresh them
+                # before the adapter step so it consumes the current backend state.
+                self._data._refresh_joint_pos()
+                self._data._refresh_joint_vel()
+            self.newton_actuator_adapter.step(w, w, OvPhysxManager.get_physics_dt())
+
+        wp.launch(
+            actuator_kernels.sync_torque_telemetry,
+            dim=(self._num_instances, self._num_joints),
+            inputs=[
+                self._data.joint_pos.warp,
+                self._data.joint_vel.warp,
+                self._data._joint_pos_target,
+                self._data._joint_vel_target,
+                self._data.joint_stiffness.warp,
+                self._data.joint_damping.warp,
+                self._data.joint_effort_limits.warp,
+                self._implicit_dof_mask,
+                w.joint_f_2d,
+                self._data._sim_bind_joint_computed_effort,
+                # The Newton wrapper and telemetry buffers stay in public order;
+                # the final actuator write performs the backend-order gather.
+                self._ALL_JOINT_INDICES,
+                False,
+            ],
+            outputs=[
+                self._data._computed_torque,
+                self._data._applied_torque,
+            ],
+            device=self._device,
+        )
+
+    def _feed_stable_pd_mass_matrix(self) -> None:
+        """Populate each ``ControllerStablePD`` state's mass matrix and bias from the wheel.
+
+        The implicit SPD solve reads ``State.mass_matrix`` every step; without it the
+        solve cancels the PD effort to ~0 and StablePD applies no torque. The wheel
+        exposes the joint-space quantities through the :attr:`TT.MASS_MATRIX` /
+        :attr:`TT.CORIOLIS` / :attr:`TT.GRAVITY_FORCE` bindings (fixed base:
+        ``[N, D, D]`` and ``[N, D]``, verified against a live articulation; the
+        floating-base layout is unverified, guarded at setup).
+
+        ``bias_forces`` receives ``C(q, q̇) q̇`` plus, per the actuator's
+        ``gravity_compensation`` mode, ``g(q)``: ``"bias"`` folds it into the implicit
+        bias (partial compensation), ``"feedforward"`` gathers it into the controller's
+        ``const_effort`` channel (full weight, effort-clamped), ``"none"`` drops it.
+        Joint armature is added to the diagonal of M: the wheel reports the bare
+        rigid-body matrix, but the SPD predictor needs the effective inertia
+        ``M + armature`` (near-zero-inertia drives rely on it entirely).
+        No-op unless this articulation has StablePD actuators.
+        """
+        slices = getattr(self, "_stable_pd_slices", None)
+        if not slices or self.newton_actuator_adapter is None:
+            return
+        self._root_view.read_into(TT.MASS_MATRIX, self._spd_mass_buf)
+        self._root_view.read_into(TT.CORIOLIS, self._spd_coriolis_buf)
+        mass_matrix = wp.to_torch(self._spd_mass_buf)  # (N, D, D)
+        coriolis = wp.to_torch(self._spd_coriolis_buf)  # (N, D)
+        if self._stable_pd_gravity_on:
+            self._root_view.read_into(TT.GRAVITY_FORCE, self._spd_gravity_buf)
+            gravity = wp.to_torch(self._spd_gravity_buf)  # (N, D)
+        else:
+            gravity = None
+        armature = self._data.joint_armature.torch  # (N, D)
+        # CPU-native bindings surface as host tensors; move to the sim device once.
+        if mass_matrix.device != armature.device:
+            mass_matrix = mass_matrix.to(armature.device)
+            coriolis = coriolis.to(armature.device)
+            if gravity is not None:
+                gravity = gravity.to(armature.device)
+        full_bias = coriolis + gravity if gravity is not None else coriolis
+        for (act_idx, _), joints_t, backend_joints_t, mode, const_effort in zip(
+            slices,
+            self._stable_pd_local_joint_tensors,
+            self._stable_pd_backend_joint_tensors,
+            self._stable_pd_gravity_modes,
+            self._stable_pd_const_efforts,
+        ):
+            ctrl_state = self.newton_actuator_adapter.current_controller_state(act_idx)
+            if ctrl_state is None or ctrl_state.mass_matrix is None:
+                continue
+            # The wheel exposes inverse-dynamics quantities in backend order;
+            # gather them into the adapter's public joint order.
+            block = mass_matrix.index_select(1, backend_joints_t).index_select(2, backend_joints_t)
+            row_bias = full_bias if mode == "bias" else coriolis
+            bias_block = row_bias.index_select(1, backend_joints_t)
+            if mode == "feedforward" and gravity is not None and const_effort is not None:
+                # Full-weight gravity comp through const_effort: env-major flat
+                # (num_envs · n,), overwritten every feed (no accumulation).
+                g_flat = gravity.index_select(1, backend_joints_t).contiguous().reshape(-1)
+                wp.copy(const_effort, wp.from_torch(g_flat, dtype=wp.float32))
+            block = block.contiguous()
+            n = joints_t.numel()
+            d = torch.arange(n, device=block.device)
+            block[:, d, d] += armature.index_select(1, joints_t)
+            # wp.array.assign(torch_cuda) routes through numpy; wrap and copy instead.
+            wp.copy(ctrl_state.mass_matrix, wp.from_torch(block, dtype=wp.float32))
+            if ctrl_state.bias_forces is not None:
+                wp.copy(ctrl_state.bias_forces, wp.from_torch(bias_block.contiguous(), dtype=wp.float32))
 
     """
     Internal helpers -- Debugging.

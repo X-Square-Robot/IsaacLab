@@ -2943,6 +2943,97 @@ def test_get_gravity_compensation_forces_static_equilibrium(sim, num_articulatio
     )
 
 
+@pytest.mark.parametrize("num_articulations", [1])
+@pytest.mark.parametrize("device", ["cuda:0"])
+@pytest.mark.parametrize("articulation_type", ["panda"])
+@pytest.mark.isaacsim_ci
+def test_get_coriolis_centrifugal_compensation_forces_coasting_equilibrium(
+    sim, num_articulations, device, articulation_type
+):
+    """PhysX accuracy: ``τ_gc + τ_cc`` must hold the manipulator in coasting equilibrium.
+
+    Companion to :func:`test_get_gravity_compensation_forces_static_equilibrium`,
+    extended to non-zero joint velocity. The EOM identity
+    ``M(q) q̈ + C(q,q̇) q̇ + g(q) = τ_input`` with ``τ_input = C(q,q̇) q̇ + g(q)``
+    gives ``q̈ = 0`` at any ``q̇`` — the arm should coast at its initial joint
+    velocity. This pins
+    :attr:`~isaaclab.assets.BaseArticulationData.coriolis_centrifugal_compensation_forces`
+    in isolation: a sign, frame, or DoF-ordering error in ``τ_cc`` shows up as
+    velocity drift the gravity term cannot mask.
+
+    A second rollout from the same state applies ``τ_gc`` only; its drift must be
+    non-trivially larger, proving the Coriolis load is actually significant at the
+    test velocity (otherwise the with-``τ_cc`` pass would be vacuous).
+    """
+    base_cfg = generate_articulation_cfg(articulation_type=articulation_type)
+    # Zero-gain passthrough actuator + gravity ON, exactly as in the static test:
+    # the effort target IS the applied joint torque.
+    cfg = base_cfg.replace(
+        actuators={
+            "all": ImplicitActuatorCfg(
+                joint_names_expr=[".*"],
+                stiffness=0.0,
+                damping=0.0,
+            ),
+        },
+    )
+    cfg = cfg.replace(
+        spawn=cfg.spawn.replace(
+            rigid_props=cfg.spawn.rigid_props.replace(disable_gravity=False),
+        ),
+    )
+
+    articulation, _ = generate_articulation(cfg, num_articulations, device=device)
+    sim.reset()
+    assert articulation.is_initialized
+
+    init_q = articulation.data.default_joint_pos.torch.clone()
+    # Joint-velocity pattern chosen to move away from the near-limit defaults
+    # (joint4 sits at -2.81 with a -3.07 lower limit, joint6 at 3.04 with a 3.75
+    # upper limit — both get positive velocity) and to load several links at once
+    # so C(q,q̇) q̇ is non-trivial. Finger prismatic joints stay at rest.
+    init_qd = torch.zeros_like(init_q)
+    arm_vel = torch.tensor([1.5, 1.0, -1.5, 1.0, -1.5, 1.0, 1.5], device=device)
+    init_qd[:, : arm_vel.numel()] = arm_vel
+
+    num_steps = 20
+
+    def _coast_drift(with_coriolis: bool) -> float:
+        """Roll out with per-step ``τ_gc`` (+ ``τ_cc``), return max |q̇ - q̇₀|."""
+        articulation.write_joint_state_to_sim(init_q, init_qd)
+        articulation.update(sim.cfg.dt)
+        drift = 0.0
+        for _ in range(num_steps):
+            # Both compensation tensors share the ``(N, num_joints + num_base_dofs)``
+            # layout — slice past the floating-base entries (0 on fixed-base panda).
+            tau = articulation.data.gravity_compensation_forces.torch[:, articulation.num_base_dofs :].clone()
+            if with_coriolis:
+                tau += articulation.data.coriolis_centrifugal_compensation_forces.torch[:, articulation.num_base_dofs :]
+            articulation.set_joint_effort_target(tau)
+            articulation.write_data_to_sim()
+            sim.step()
+            articulation.update(sim.cfg.dt)
+            step_drift = (articulation.data.joint_vel.torch - init_qd).abs().max().item()
+            drift = max(drift, step_drift)
+        return drift
+
+    drift_full = _coast_drift(with_coriolis=True)
+    drift_no_cor = _coast_drift(with_coriolis=False)
+
+    print(f"CORIOLIS_COAST drift_full={drift_full:.4f} drift_no_cor={drift_no_cor:.4f}")
+
+    assert drift_full < 0.15, (
+        f"max joint-velocity drift {drift_full:.4f} rad/s after {num_steps} full-bias coast steps —"
+        " τ_gc + τ_cc did not hold coasting equilibrium. Check sign, DoF ordering, and whether"
+        " coriolis_centrifugal_compensation_forces returns C(q,q̇)q̇ (positive) or its negation."
+    )
+    assert drift_no_cor > 2.0 * drift_full, (
+        f"gravity-comp-only drift {drift_no_cor:.4f} rad/s is not clearly above the full-bias"
+        f" drift {drift_full:.4f} rad/s — the Coriolis load at the test velocity is too small"
+        " for this test to be informative; raise the initial joint velocity."
+    )
+
+
 @pytest.mark.parametrize("device", test_devices(DeviceScope.CUDA))
 @pytest.mark.parametrize("articulation_type", ["panda"])
 @pytest.mark.parametrize("gravity_enabled", [False])

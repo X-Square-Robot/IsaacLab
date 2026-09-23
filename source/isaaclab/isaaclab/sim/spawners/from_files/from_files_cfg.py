@@ -257,14 +257,14 @@ class UsdFileWithCompliantContactCfg(UsdFileCfg):
     """Stiffness of the compliant contact. Defaults to None.
 
     This parameter is the same as
-    :attr:`~isaaclab.sim.spawners.materials.RigidBodyMaterialCfg.compliant_contact_stiffness`.
+    :attr:`~isaaclab_physx.sim.spawners.materials.PhysxRigidBodyMaterialCfg.compliant_contact_stiffness`.
     """
 
     compliant_contact_damping: float | None = None
     """Damping of the compliant contact. Defaults to None.
 
     This parameter is the same as
-    :attr:`isaaclab.sim.spawners.materials.RigidBodyMaterialCfg.compliant_contact_damping`.
+    :attr:`isaaclab_physx.sim.spawners.materials.PhysxRigidBodyMaterialCfg.compliant_contact_damping`.
     """
 
     physics_material_prim_path: str | list[str] | None = None

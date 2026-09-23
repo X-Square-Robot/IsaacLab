@@ -259,11 +259,25 @@ def _is_virtualenv_python(python_exe: str | Path) -> bool:
     return (python_path.parent.parent / "pyvenv.cfg").is_file()
 
 
+def _python_minor_version(python_exe: str | Path) -> str | None:
+    """Return ``major.minor`` for a Python executable, or ``None`` if probing fails."""
+    result = subprocess.run(
+        [str(python_exe), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
 def get_pip_command(python_exe: str | None = None) -> list[str]:
     """Return the base pip command tokens for the current environment.
 
     When ``uv`` is available and a virtual environment is active, returns
-    ``["uv", "pip"]``.  When the target Python belongs to a virtual
+    ``["uv", "--preview-features", "extra-build-dependencies", "pip"]``.
+    When the target Python belongs to a virtual
     environment, ``UV_PYTHON`` is set so ``uv pip`` installs into that
     environment even if the process itself is not activated.  Otherwise returns
     ``[python_exe, "-m", "pip"]`` so that the target interpreter's own pip is
@@ -279,7 +293,7 @@ def get_pip_command(python_exe: str | None = None) -> list[str]:
     in_venv = bool(os.environ.get("VIRTUAL_ENV") or os.environ.get("CONDA_PREFIX") or (sys.prefix != sys.base_prefix))
     if shutil.which("uv") and (in_venv or _is_virtualenv_python(python_exe)):
         os.environ["UV_PYTHON"] = python_exe
-        return ["uv", "pip"]
+        return ["uv", "--preview-features", "extra-build-dependencies", "pip"]
 
     return [python_exe, "-m", "pip"]
 
@@ -320,6 +334,15 @@ def extract_python_exe() -> str:
                 python_exe = Path(conda_prefix) / "bin" / "python"
                 if not python_exe.exists():
                     python_exe = Path(conda_prefix) / "bin" / "python3"
+            version = _python_minor_version(python_exe)
+            if version != "3.12":
+                repo_venv = ISAACLAB_ROOT / "env_isaaclab" / ("Scripts/python.exe" if is_windows() else "bin/python")
+                if repo_venv.exists() and _python_minor_version(repo_venv) == "3.12":
+                    print_warning(
+                        f"Active conda Python is {version or 'unusable'}; using repo-local "
+                        f"Python 3.12 for Isaac Sim compatibility: {repo_venv}"
+                    )
+                    python_exe = repo_venv
         else:
             print_debug("extract_python_exe(): No CONDA_PREFIX found.")
 
@@ -367,13 +390,7 @@ def extract_python_exe() -> str:
         python_exe = Path(system_python_exe) if system_python_exe else None
         print_debug(f"extract_python_exe(): System python candidate: {python_exe}")
         if python_exe and python_exe.exists():
-            result = subprocess.run(
-                [str(python_exe), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            version = result.stdout.strip()
+            version = _python_minor_version(python_exe)
             if version != "3.12":
                 print_error(f"Falling back on system Python {version} ({python_exe}), but 3.12 is required.")
                 sys.exit(1)

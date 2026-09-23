@@ -58,6 +58,17 @@ class ManagerBasedRLEnvCfg(ManagerBasedEnvCfg):
         Currently consumed by the :class:`~isaaclab_rl.sb3.Sb3VecEnvWrapper` wrapper.
     """
 
+    recorder_obs_refresh: bool = True
+    """Recompute observations before recorder post-step terms run. Default is True.
+
+    When recorder terms are active, :meth:`~isaaclab.envs.ManagerBasedRLEnv.step` refreshes
+    :attr:`~isaaclab.envs.ManagerBasedRLEnv.obs_buf` before calling
+    ``recorder_manager.record_post_step()`` so post-step recorder terms can read fresh
+    observations. Set to False when no active recorder term reads ``obs_buf`` in its
+    ``record_post_step`` (pre-step observation recorders are unaffected); this skips one
+    full observation computation per step in recording mode.
+    """
+
     episode_length_s: float = MISSING
     """Duration of an episode (in seconds).
 

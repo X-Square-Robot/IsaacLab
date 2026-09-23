@@ -698,7 +698,6 @@ def test_gravity_vec_w_tracks_model_gravity(num_envs, num_cubes, device):
         # GRAVITY_VEC_W must share storage with Newton's per-env gravity array.
         model = SimulationManager.get_model()
         model_gravity_arr = model.gravity[: model.world_count]
-        global_gravity = wp.to_torch(model.gravity)[-1].clone()
         assert object_collection.data.GRAVITY_VEC_W.warp.ptr == model_gravity_arr.ptr
         assert object_collection.data.GRAVITY_VEC_W.shape == (num_envs,)
 
@@ -710,7 +709,6 @@ def test_gravity_vec_w_tracks_model_gravity(num_envs, num_cubes, device):
         )
         wp.to_torch(model_gravity_arr).copy_(new_gravity)
         SimulationManager.add_model_change(ModelFlags.MODEL_PROPERTIES)
-        torch.testing.assert_close(wp.to_torch(model.gravity)[-1], global_gravity)
 
         # Recompute the lazily-cached projected_gravity_b without sim.step: bodies stay
         # at identity orientation, so each env's unit gravity broadcasts across its bodies.

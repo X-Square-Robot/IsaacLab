@@ -233,5 +233,6 @@ def build_implicit_dof_mask(
         if isinstance(j_ids, slice) or j_ids is None:
             modes[:] = 1
         else:
-            modes[j_ids.long()] = 1
+            # joint_indices is a torch tensor on some backends, a plain list on others
+            modes[torch.as_tensor(j_ids, dtype=torch.long, device=device)] = 1
     return wp.from_torch(modes, dtype=wp.int32), modes

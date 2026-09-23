@@ -81,8 +81,7 @@ class RigidObjectData(BaseRigidObjectData):
 
         # Bind ``GRAVITY_VEC_W`` to Newton's per-env ``model.gravity`` (m/s^2) so
         # per-env gravity randomization stays live; consumers normalize on read.
-        # The final entry is reserved for Newton's global world and is not an
-        # Isaac Lab environment.
+        # Limit the live view to entries associated with Isaac Lab environments.
         model = SimulationManager.get_model()
         self.GRAVITY_VEC_W = ProxyArray(model.gravity[: model.world_count])
         forward_vec = np.full((self._root_view.count, 3), (1.0, 0.0, 0.0), dtype=np.float32)
@@ -963,10 +962,11 @@ class RigidObjectData(BaseRigidObjectData):
         # Initialize history for finite differencing. If the rigid object is fixed, the root com velocity is not
         # available, so we use zeros.
         if self._root_view.get_root_velocities(SimulationManager.get_state_0()) is None:
-            logger.warning(
-                "Failed to get root com velocity. If the rigid object is fixed, this is expected. "
-                "Setting root com velocity to zeros."
-            )
+            # Expected for fixed rigid objects (no root velocity exists); only warn otherwise.
+            if self._root_view.is_fixed_base:
+                logger.debug("Root com velocity is not available for fixed rigid objects. Setting it to zeros.")
+            else:
+                logger.warning("Failed to get root com velocity. Setting root com velocity to zeros.")
             self._sim_bind_root_com_vel_w = wp.zeros(
                 (self._num_instances,), dtype=wp.spatial_vectorf, device=self.device
             )

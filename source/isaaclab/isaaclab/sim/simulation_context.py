@@ -184,6 +184,10 @@ class SimulationContext:
         # registered during initialize() (e.g. PhysxManager's headless video pump) succeed.
         self._render_callbacks: dict[str, tuple[int, Callable[[Any], None]]] = {}
         self.physics_manager.initialize(self)
+        if has_kit():
+            from ._kit_physics_ui import sync_kit_physics_ui_label
+
+            sync_kit_physics_ui_label(self.cfg.physics)
 
         # Initialize visualizer state (visualizers are created lazily during initialize_visualizers()).
         self._scene_data_provider = SceneDataProvider(self.physics_manager.get_scene_data_backend())
@@ -705,19 +709,48 @@ class SimulationContext:
         self.physics_manager.play()
         self._is_playing = True
         self._is_stopped = False
+        self._sync_kit_toolbar_play_button()
 
     def step(self, render: bool = True) -> None:
         """Step physics and optionally render.
 
-        If the timeline is paused (e.g. via the GUI), this method blocks and keeps
-        the visualizer responsive until the timeline is resumed or stopped.
+        If any attached visualizer has training paused, this method blocks
+        (while keeping the visualizer responsive) until training is resumed.
+        This ensures that no physics steps are taken while paused — even
+        during the first decimation window before ``render()`` is called.
+
+        If the user closes a visualizer window while training is paused, the
+        pause-gate's ``is_running()`` guard flips to ``False`` and the loop
+        would otherwise fall through into a "ghost" physics step. To preserve
+        the "window closed = nothing runs" contract, we detect the closed
+        viewer after the pause-gate and skip the physics step entirely —
+        outer run loops then observe ``is_running() == False`` on the next
+        iteration and exit cleanly.
 
         Args:
             render: Whether to render the scene after stepping. Defaults to True.
         """
-        # Block while the GUI timeline is paused so the entire training loop freezes.
-        # See: https://github.com/isaac-sim/IsaacLab/issues/4279
-        self.physics_manager.wait_for_playing()
+        # Block while any visualizer has training paused, keeping the viewer
+        # responsive so the user can click "Resume Training".
+        for viz in self._visualizers:
+            try:
+                while viz.is_training_paused() and viz.is_running() and not viz.is_closed:
+                    self.update_scene_data_provider()
+                    viz.step(0.0)
+            except Exception:
+                pass
+
+        # Close-detection gate: if the user just closed a viewer window (or a
+        # viewer otherwise flipped to not-running), do not advance physics
+        # this tick. This prevents a stray physics step from leaking through
+        # when the pause-gate exits because ``is_running()`` became False.
+        for viz in self._visualizers:
+            try:
+                if viz.is_closed or not viz.is_running():
+                    return
+            except Exception:
+                pass
+
         self._physics_step_count += 1
         self.physics_manager.step()
         if render and self.is_rendering:
@@ -823,6 +856,7 @@ class SimulationContext:
             viz.play()
         self._is_playing = True
         self._is_stopped = False
+        self._sync_kit_toolbar_play_button()
 
     def pause(self) -> None:
         """Pause the simulation (can be resumed with play)."""
@@ -830,6 +864,7 @@ class SimulationContext:
         for viz in self._visualizers:
             viz.pause()
         self._is_playing = False
+        self._sync_kit_toolbar_play_button()
 
     def stop(self) -> None:
         """Stop the simulation completely."""
@@ -838,6 +873,22 @@ class SimulationContext:
             viz.stop()
         self._is_playing = False
         self._is_stopped = True
+        self._sync_kit_toolbar_play_button()
+
+    def _playback_state_for_toolbar(self) -> tuple[bool, bool]:
+        """Return ``(is_playing, is_stopped)`` for Kit toolbar playback controls."""
+        return bool(self._is_playing), bool(self._is_stopped)
+
+    def _sync_kit_toolbar_play_button(self) -> None:
+        """Mirror Isaac Lab lifecycle state into the Kit toolbar play button when Kit is available."""
+        try:
+            from isaaclab.app.app_launcher import sync_toolbar_playback_controls
+        except ImportError as exc:
+            logger.debug("Skipping Kit toolbar play-button sync because AppLauncher is unavailable: %s", exc)
+            return
+
+        is_playing, is_stopped = self._playback_state_for_toolbar()
+        sync_toolbar_playback_controls(is_playing=is_playing, is_stopped=is_stopped)
 
     def request_reset(self) -> None:
         """Request an episode reset from a UI control (e.g. the Kit window button).

@@ -84,6 +84,8 @@ def _parse_stub(
 def lazy_export(
     *,
     packages: list[str] | tuple[str, ...] | None = None,
+    eager_absolute_imports: bool = True,
+    skip_absolute_imports: set[str] | frozenset[str] | None = None,
 ) -> tuple[Callable[[str], object], Callable[[], list[str]], list[str]]:
     """Lazy-load names from a ``.pyi`` stub.
 
@@ -113,6 +115,14 @@ def lazy_export(
         packages: **Deprecated.**  Fallback packages are now inferred from
             absolute wildcard imports in the ``.pyi`` stub.  Passing this
             argument still works but emits a :class:`DeprecationWarning`.
+        eager_absolute_imports: Whether explicit absolute imports in the
+            ``.pyi`` stub should be imported immediately. Disable this for
+            packages that provide their own runtime ``__getattr__`` shims for
+            those names to avoid circular imports during extension startup.
+        skip_absolute_imports: Fully-qualified packages from explicit absolute
+            imports that should not be imported eagerly. This keeps local
+            runtime exports eager while leaving selected backend-forwarded
+            names to a module-level ``__getattr__`` shim.
 
     Raises:
         ImportError: If the ``.pyi`` stub declares ``from pkg import *`` but
@@ -152,12 +162,20 @@ def lazy_export(
     mod = sys.modules[package_name]
 
     # -- Eagerly resolve absolute named imports (from pkg import a, b) -----
-    for abs_pkg, names in absolute_named.items():
-        pkg_mod = importlib.import_module(abs_pkg)
-        for name in names:
-            mod.__dict__[name] = getattr(pkg_mod, name)
-            if name not in __all__:
-                __all__.append(name)
+    # Some compatibility packages keep absolute imports in their ``.pyi`` files
+    # for type checkers while resolving them through a hand-written runtime
+    # ``__getattr__``.  Let those packages opt out so importing the shim does
+    # not pull backend extensions into partially-initialized core packages.
+    skipped_absolute_imports = skip_absolute_imports or set()
+    if eager_absolute_imports:
+        for abs_pkg, names in absolute_named.items():
+            if abs_pkg in skipped_absolute_imports:
+                continue
+            pkg_mod = importlib.import_module(abs_pkg)
+            for name in names:
+                mod.__dict__[name] = getattr(pkg_mod, name)
+                if name not in __all__:
+                    __all__.append(name)
 
     # -- Eagerly resolve relative wildcard imports (from .X import *) ------
     for rel_mod_name in relative_wildcards:

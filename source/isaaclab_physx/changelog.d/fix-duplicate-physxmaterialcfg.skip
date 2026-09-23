@@ -1,0 +1,5 @@
+Internal fix: removed a duplicate ``PhysxMaterialCfg`` class definition in
+``sim/spawners/materials/physics_materials_cfg.py`` introduced by a merge (the
+duplicate also carried a doubled ``damping_combine_mode`` field). The surviving
+definition is unchanged, so there is no user-facing effect; this only clears a
+``ruff`` F811 redefinition error.

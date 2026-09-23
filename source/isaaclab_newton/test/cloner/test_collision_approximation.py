@@ -10,7 +10,7 @@ import pytest
 from isaaclab_newton.cloner.newton_clone_utils import build_source_builders
 from newton import GeoType, ShapeFlags
 
-from pxr import Usd, UsdGeom, UsdPhysics
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 _SOURCE = "/World/Asset"
 
@@ -38,6 +38,14 @@ def _add_l_prism(stage: Usd.Stage, path: str, approximation: str | None, offset:
     mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
     if approximation is not None:
         mesh_collision.CreateApproximationAttr().Set(approximation)
+
+
+def _add_visual_triangle(stage: Usd.Stage, path: str) -> None:
+    """Author a visual-only triangle so collider visibility uses mixed-model policy."""
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    mesh.CreatePointsAttr([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)])
+    mesh.CreateFaceVertexCountsAttr([3])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
 
 
 def _make_stage(approximation: str | None) -> Usd.Stage:
@@ -126,6 +134,54 @@ class TestClonerCollisionApproximation:
         assert len(shapes) >= 2, f"expected a multi-hull decomposition, got {shapes}"
         assert all(geo_type == GeoType.CONVEX_MESH for geo_type in shapes.values())
 
+    def test_convex_decomposition_preserves_nonadjacent_self_collision_filters(self):
+        """New convex parts inherit filters authored before mesh decomposition."""
+        from newton._src.usd.schemas import SchemaResolverPhysx
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        root = UsdGeom.Xform.Define(stage, _SOURCE)
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+        root.GetPrim().CreateAttribute("physxArticulation:enabledSelfCollisions", Sdf.ValueTypeNames.Bool).Set(False)
+
+        bodies = []
+        for index in range(3):
+            body = UsdGeom.Xform.Define(stage, f"{_SOURCE}/Body{index}")
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            _add_l_prism(stage, f"{body.GetPath()}/geom", "convexDecomposition", offset=3.0 * index)
+            bodies.append(body)
+
+        for index in range(2):
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f"{_SOURCE}/Joint{index}")
+            joint.CreateBody0Rel().SetTargets([bodies[index].GetPath()])
+            joint.CreateBody1Rel().SetTargets([bodies[index + 1].GetPath()])
+
+        builder = build_source_builders(
+            stage,
+            [_SOURCE],
+            create_builder=lambda: newton.ModelBuilder(up_axis=newton.Axis.Z),
+            schema_resolvers=[SchemaResolverPhysx()],
+        )[_SOURCE]
+        body0 = builder.body_label.index(str(bodies[0].GetPath()))
+        body2 = builder.body_label.index(str(bodies[2].GetPath()))
+        shapes0 = [
+            shape for shape in builder.body_shapes[body0] if builder.shape_flags[shape] & ShapeFlags.COLLIDE_SHAPES
+        ]
+        shapes2 = [
+            shape for shape in builder.body_shapes[body2] if builder.shape_flags[shape] & ShapeFlags.COLLIDE_SHAPES
+        ]
+        assert len(shapes0) >= 2 and len(shapes2) >= 2
+
+        filtered = {tuple(sorted(pair)) for pair in builder.shape_collision_filter_pairs}
+        missing = {
+            tuple(sorted((shape0, shape2)))
+            for shape0 in shapes0
+            for shape2 in shapes2
+            if tuple(sorted((shape0, shape2))) not in filtered
+        }
+        assert not missing
+
     @pytest.mark.parametrize(
         ("approximation", "expected"),
         [
@@ -150,6 +206,32 @@ class TestClonerCollisionApproximation:
         """simplify_meshes=False leaves an unauthored mesh untouched."""
         shapes = _collision_shapes(_build(_make_stage(None), simplify_meshes=False))
         assert list(shapes.values()) == [GeoType.MESH]
+
+    def test_visualization_only_keeps_authored_mesh_raw(self):
+        """Visualization shadows never cook an authored collision approximation."""
+        shapes = _collision_shapes(_build(_make_stage("convexDecomposition"), visualization_only=True))
+        assert list(shapes.values()) == [GeoType.MESH]
+
+    def test_visualization_only_shows_collider_when_body_has_no_visual_mesh(self):
+        """Collider-only bodies remain visible when another body supplies visual geometry."""
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdGeom.Xform.Define(stage, _SOURCE)
+        body = UsdGeom.Xform.Define(stage, f"{_SOURCE}/ColliderOnlyBody")
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        _add_l_prism(stage, f"{body.GetPath()}/geom", "convexDecomposition")
+        visual_body = UsdGeom.Xform.Define(stage, f"{_SOURCE}/VisualBody")
+        UsdPhysics.RigidBodyAPI.Apply(visual_body.GetPrim())
+        _add_visual_triangle(stage, f"{visual_body.GetPath()}/visual")
+
+        builder = _build(stage, visualization_only=True)
+        collision_indices = [
+            index for index, flags in enumerate(builder.shape_flags) if flags & ShapeFlags.COLLIDE_SHAPES
+        ]
+
+        assert len(collision_indices) == 1
+        assert builder.shape_flags[collision_indices[0]] & ShapeFlags.VISIBLE
 
     def test_simplify_pass_only_touches_unauthored_meshes(self):
         """In a mixed stage, only the unauthored mesh gets the default hull treatment."""
@@ -194,3 +276,20 @@ class TestClonerCollisionApproximation:
         assert not flags_by_label[f"{_SOURCE}/Authored/collider"] & ShapeFlags.VISIBLE
         assert flags_by_label[f"{_SOURCE}/StaticPrimitive/geometry"] & ShapeFlags.VISIBLE
         assert not flags_by_label[f"{_SOURCE}/StaticAuthored/collider"] & ShapeFlags.VISIBLE
+
+    def test_collider_with_visual_material_hides_when_body_has_visual_shape(self):
+        """Authored render materials do not reveal colliders over separate visual geometry."""
+        stage = _make_mixed_visual_stage()
+        material = UsdShade.Material.Define(stage, "/World/Looks/ColliderMaterial")
+        shader = UsdShade.Shader.Define(stage, "/World/Looks/ColliderMaterial/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        collider_path = f"{_SOURCE}/Authored/collider"
+        collider = stage.GetPrimAtPath(collider_path)
+        UsdShade.MaterialBindingAPI.Apply(collider).Bind(material)
+
+        builder = _build(stage)
+        flags_by_label = dict(zip(builder.shape_label, builder.shape_flags, strict=True))
+
+        assert not flags_by_label[collider_path] & ShapeFlags.VISIBLE

@@ -82,6 +82,7 @@ class NewtonMPMManager(NewtonManager):
         and indices but only accepts the triangle-mesh geometry type, so classify
         convex meshes as meshes without changing their geometry.
         """
+        super()._prepare_builder_for_finalize(builder)
         kinematic_flag = int(BodyFlags.KINEMATIC)
         for body_id, flags in enumerate(builder.body_flags):
             if int(flags) & kinematic_flag:

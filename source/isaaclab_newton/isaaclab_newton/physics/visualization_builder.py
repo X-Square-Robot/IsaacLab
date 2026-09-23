@@ -105,6 +105,10 @@ def build_visualization_builder_from_stage_envs(
         deformable_ignore_paths = _deformable_ignore_paths(stage, entries=deformable_entries)
         import_result = builder.add_usd(
             stage,
+            load_visual_shapes=True,
+            skip_mesh_approximation=True,
+            hide_collision_shapes=True,
+            force_show_colliders=True,
             schema_resolvers=schema_resolvers,
             ignore_paths=deformable_ignore_paths or None,
         )
@@ -134,6 +138,10 @@ def build_visualization_builder_from_stage_envs(
     import_result = builder.add_usd(
         stage,
         ignore_paths=["/World/envs", *sources, *deformable_ignore_paths],
+        load_visual_shapes=True,
+        skip_mesh_approximation=True,
+        hide_collision_shapes=True,
+        force_show_colliders=True,
         schema_resolvers=schema_resolvers,
     )
     _restore_visible_colliders_without_visual_shapes(builder, stage, import_result["path_shape_map"])
@@ -145,6 +153,7 @@ def build_visualization_builder_from_stage_envs(
         schema_resolvers,
         ignore_paths=source_deformable_ignore_paths or None,
         simplify_meshes=False,
+        visualization_only=True,
     )
     replicate_builder_mapping(builder, sources, mapping, positions, quaternions, source_builders)
     rename_builder_labels(builder, sources, destinations, env_ids, mapping)

@@ -475,23 +475,6 @@ Changed
   ``warp-lang`` 1.13 API (the ``wp.math`` namespace was removed).
 
 
-0.1.4 (2026-05-08)
-~~~~~~~~~~~~~~~~~~
-
-Changed
-^^^^^^^
-
-* Modified the OVRTX renderer to use the new patterns from renderer/camera decoupling.
-
-Fixed
-^^^^^
-
-* Fixed ``AttributeError: 'Renderer' object has no attribute 'add_usd'`` in
-  :class:`~isaaclab_ov.renderers.OVRTXRenderer` when using ``ovrtx`` 0.3.0 or
-  newer. The renderer now calls :meth:`ovrtx.Renderer.open_usd` on 0.3.0+ and
-  falls back to ``Renderer.add_usd`` on older versions.
-
-
 0.1.3 (2026-04-30)
 ~~~~~~~~~~~~~~~~~~
 

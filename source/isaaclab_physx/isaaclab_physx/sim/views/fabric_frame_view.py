@@ -173,6 +173,7 @@ class FabricFrameView(BaseFrameView):
         prim_path: str,
         device: str = "cpu",
         validate_xform_ops: bool = True,
+        sync_usd_on_fabric_write: bool = False,
         stage: Usd.Stage | None = None,
         **kwargs,
     ):
@@ -192,6 +193,7 @@ class FabricFrameView(BaseFrameView):
         """
         self._usd_view = UsdFrameView(prim_path, device=device, validate_xform_ops=validate_xform_ops, stage=stage)
         self._device = device
+        self._sync_usd_on_fabric_write = sync_usd_on_fabric_write
 
         settings = SettingsManager.instance()
         self._use_fabric = bool(settings.get("/physics/fabricEnabled", False))

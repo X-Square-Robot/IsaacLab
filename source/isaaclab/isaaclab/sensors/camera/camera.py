@@ -544,7 +544,9 @@ class Camera(SensorBase):
         # references to prims located in the stage.
         sim_ctx.render_context.ensure_prepare_stage(self.stage, self._num_envs)
 
-        self._view = FrameView(self.cfg.prim_path, device=self._device, stage=self.stage)
+        # Create a view for the sensor with Fabric enabled for fast pose queries.
+        # TODO: remove sync_usd_on_fabric_write=True once the GPU Fabric sync bug is fixed.
+        self._view = FrameView(self.cfg.prim_path, device=self._device, stage=self.stage, sync_usd_on_fabric_write=True)
         # Check that sizes are correct
         if self._view.count != self._num_envs:
             raise RuntimeError(

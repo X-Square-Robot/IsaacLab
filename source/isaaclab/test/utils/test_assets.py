@@ -430,3 +430,23 @@ def test_newton_asset_dir_uses_environment_override(tmp_path, monkeypatch):
     finally:
         monkeypatch.delenv("NEWTON_ASSET_DIR", raising=False)
         importlib.reload(assets_utils)
+
+
+def test_strip_usd_package_path_removes_trailing_package_suffix():
+    """Packaged refs must reduce to the container asset for file I/O."""
+    assert assets_utils._strip_usd_package_path("../InteriorGS_usdz/839873.usdz[gauss.usda]") == (
+        "../InteriorGS_usdz/839873.usdz"
+    )
+    assert assets_utils._strip_usd_package_path("839873.usdz") == "839873.usdz"
+    assert assets_utils._strip_usd_package_path("") == ""
+
+
+def test_resolve_reference_url_strips_usd_package_path_for_nucleus_download():
+    """InteriorGS-style ``usdz[layer]`` refs must resolve to the usdz container URL."""
+    base = "omniverse://8.130.45.253/Library/art_assets/scenes/sage_3dgs_collision/Data/InteriorGS_usda/839873.usda"
+    resolved = assets_utils._resolve_reference_url(base, "../InteriorGS_usdz/InteriorGS_usdz/839873.usdz[gauss.usda]")
+    assert resolved == (
+        "omniverse://8.130.45.253/Library/art_assets/scenes/sage_3dgs_collision/"
+        "Data/InteriorGS_usdz/InteriorGS_usdz/839873.usdz"
+    )
+    assert "[" not in resolved

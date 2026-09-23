@@ -28,7 +28,15 @@ To make it convenient to use the module, we recommend importing the module as fo
 
 from isaaclab.utils.module import lazy_export
 
-_stub_getattr, _stub_dir, __all__ = lazy_export()
+_stub_getattr, _stub_dir, __all__ = lazy_export(
+    skip_absolute_imports=frozenset(
+        {
+            "isaaclab_newton.sim.schemas.schemas_cfg",
+            "isaaclab_physx.sim.schemas.schemas_cfg",
+            "isaaclab_physx.sim.spawners.materials.physics_materials_cfg",
+        }
+    )
+)
 
 # Names that moved out of this package into ``isaaclab_physx.sim.schemas``.
 # Resolved lazily on first access so importing ``isaaclab.sim`` does not
@@ -93,6 +101,8 @@ _NEWTON_FORWARDS = frozenset(
         "NewtonSDFCollisionPropertiesCfg",
     }
 )
+
+__all__ = sorted(set(__all__) | _PHYSX_FORWARDS | _NEWTON_FORWARDS)
 
 
 def __getattr__(name):

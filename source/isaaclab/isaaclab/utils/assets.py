@@ -27,6 +27,9 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 _UDIM_RE = re.compile(r"<UDIM>", re.IGNORECASE)
+# USD package-relative composition: ``asset.usdz[inner.usda]``. Nucleus/local
+# file I/O must target the container asset, not the packaged path string.
+_USD_PACKAGE_PATH_RE = re.compile(r"\[[^\]]+\]$")
 _USD_EXTENSIONS = {".usd", ".usda", ".usdc", ".usdz"}
 _MDL_RESOURCE_RE = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"|/\*.*?\*/|//[^\r\n]*', re.DOTALL)
 _MDL_TEXTURE_RE = re.compile(r"\.(?:bmp|dds|exr|hdr|ies|jpe?g|ktx2?|png|tga|tiff?|tx)(?:[?#].*)?$", re.IGNORECASE)
@@ -94,6 +97,9 @@ ISAAC_NUCLEUS_DIR: str = f"{NUCLEUS_ASSET_ROOT_DIR}/Isaac"
 
 ISAACLAB_NUCLEUS_DIR: str = f"{ISAAC_NUCLEUS_DIR}/IsaacLab"
 """Path to the ``Isaac/IsaacLab`` directory on the NVIDIA Nucleus Server."""
+
+X2ROBOT_NUCLEUS_DIR: str = "omniverse://8.130.45.253/Library/simready"
+"""Path to the X2Robot internal Nucleus server hosting simready assets."""
 
 NEWTON_ASSET_REPO_URL: str = "https://github.com/newton-physics/newton-assets.git"
 """URL of the Newton asset repository."""
@@ -668,6 +674,17 @@ def _find_mdl_import_dependencies(import_clause: str) -> set[str]:
     return refs
 
 
+def _strip_usd_package_path(path: str) -> str:
+    """Strip a trailing USD package path suffix ``asset[inner]`` → ``asset``.
+
+    ``UsdUtils.ModifyAssetPaths`` reports packaged references such as
+    ``../foo.usdz[gauss.usda]``. Those strings are not valid Nucleus/local file
+    paths for ``omni.client.copy``; the container asset must be fetched so the
+    locally mirrored root layer can still resolve the package-relative arc.
+    """
+    return _USD_PACKAGE_PATH_RE.sub("", path)
+
+
 def _resolve_reference_url(base_url: str, ref: str) -> str:
     """Resolve a USD reference against a base URL.
 
@@ -681,6 +698,9 @@ def _resolve_reference_url(base_url: str, ref: str) -> str:
     ref = ref.strip()
     if not ref:
         return ref
+
+    # Download the container asset for package-relative refs (``usdz[layer]``).
+    ref = _strip_usd_package_path(ref)
 
     parsed_ref = urlparse(ref)
     if parsed_ref.scheme:

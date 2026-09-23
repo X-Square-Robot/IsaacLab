@@ -678,6 +678,234 @@ def shift_jacobian_com_to_origin(
     dst[n, b, 5, dof] = omega[2]
 
 
+vec6f = wp.types.vector(length=6, dtype=wp.float32)
+
+
+@wp.kernel
+def gather_stable_pd_mass_block(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    armature: wp.array2d(dtype=wp.float32),
+    joints: wp.array(dtype=wp.int32),
+    base_offset: wp.int32,
+    out_block: wp.array3d(dtype=wp.float32),
+):
+    """Gather one StablePD actuator's symmetric mass sub-block, adding armature on the diagonal.
+
+    Kernel counterpart of the torch slicing formerly in
+    ``Articulation._feed_stable_pd_mass_matrix``: pure in-place launches so the feed can be
+    captured into a CUDA graph. On a floating base the Schur reduction kernels below must run
+    afterwards to eliminate the unactuated base block.
+
+    Args:
+        mass_matrix: PhysX generalized mass matrix. Shape is
+            (num_instances, base_offset + num_joints, base_offset + num_joints).
+        armature: Joint armature (reflected motor inertia) added to the diagonal. Shape is
+            (num_instances, num_joints).
+        joints: Articulation-local joint index of each actuator DOF, in the actuator's DOF order.
+            Shape is (num_actuator_dofs,).
+        base_offset: Root DOFs prepended by PhysX to the generalized rows/columns — ``6`` on a
+            floating base, ``0`` otherwise.
+        out_block: The controller state's mass matrix. Shape is
+            (num_instances, num_actuator_dofs, num_actuator_dofs).
+    """
+    e, i, j = wp.tid()
+    v = mass_matrix[e, base_offset + joints[i], base_offset + joints[j]]
+    if i == j:
+        v += armature[e, joints[i]]
+    out_block[e, i, j] = v
+
+
+@wp.kernel
+def gather_stable_pd_bias(
+    coriolis: wp.array2d(dtype=wp.float32),
+    gravity: wp.array2d(dtype=wp.float32),
+    add_gravity: wp.int32,
+    joints: wp.array(dtype=wp.int32),
+    base_offset: wp.int32,
+    out_bias: wp.array2d(dtype=wp.float32),
+):
+    """Gather one StablePD actuator's RNEA bias rows: ``C(q, q̇) q̇`` plus optionally ``g(q)``.
+
+    Args:
+        coriolis: Coriolis/centrifugal compensation forces. Shape is
+            (num_instances, base_offset + num_joints).
+        gravity: Gravity compensation forces. Pass ``coriolis`` again when unused. Shape is
+            (num_instances, base_offset + num_joints).
+        add_gravity: ``1`` to fold gravity into the bias (``"bias"`` mode), ``0`` otherwise.
+        joints: Articulation-local joint index of each actuator DOF. Shape is (num_actuator_dofs,).
+        base_offset: Root DOFs prepended by PhysX — ``6`` on a floating base, ``0`` otherwise.
+        out_bias: The controller state's bias forces. Shape is (num_instances, num_actuator_dofs).
+    """
+    e, i = wp.tid()
+    v = coriolis[e, base_offset + joints[i]]
+    if add_gravity != 0:
+        v += gravity[e, base_offset + joints[i]]
+    out_bias[e, i] = v
+
+
+@wp.kernel
+def gather_stable_pd_const_effort(
+    gravity: wp.array2d(dtype=wp.float32),
+    joints: wp.array(dtype=wp.int32),
+    base_offset: wp.int32,
+    out_flat: wp.array(dtype=wp.float32),
+):
+    """Gather full-weight gravity compensation into a controller's flat ``const_effort`` channel.
+
+    Args:
+        gravity: Gravity compensation forces. Shape is (num_instances, base_offset + num_joints).
+        joints: Articulation-local joint index of each actuator DOF. Shape is (num_actuator_dofs,).
+        base_offset: Root DOFs prepended by PhysX — ``6`` on a floating base, ``0`` otherwise.
+        out_flat: The controller's ``const_effort``, env-major flat. Shape is
+            (num_instances * num_actuator_dofs,).
+    """
+    e, i = wp.tid()
+    out_flat[e * joints.shape[0] + i] = gravity[e, base_offset + joints[i]]
+
+
+@wp.kernel
+def stable_pd_schur_factor_base(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    L_bb: wp.array3d(dtype=wp.float32),
+):
+    """Cholesky-factorize each env's 6x6 floating-base block ``M_bb`` (rows/cols 0..5).
+
+    The free-joint spatial inertia block is symmetric positive definite for any
+    articulation with mass, so the factorization needs no pivoting or regularization.
+
+    Args:
+        mass_matrix: PhysX generalized mass matrix. Shape is
+            (num_instances, 6 + num_joints, 6 + num_joints).
+        L_bb: Output lower-triangular factors. Shape is (num_instances, 6, 6). Upper
+            triangle is never read or written.
+    """
+    e = wp.tid()
+    for j in range(6):
+        s = mass_matrix[e, j, j]
+        for k in range(j):
+            s = s - L_bb[e, j, k] * L_bb[e, j, k]
+        d = wp.sqrt(s)
+        L_bb[e, j, j] = d
+        for i in range(j + 1, 6):
+            t = mass_matrix[e, i, j]
+            for k in range(j):
+                t = t - L_bb[e, i, k] * L_bb[e, j, k]
+            L_bb[e, i, j] = t / d
+
+
+@wp.kernel
+def stable_pd_schur_solve_base(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    coriolis: wp.array2d(dtype=wp.float32),
+    gravity: wp.array2d(dtype=wp.float32),
+    base_has_gravity: wp.int32,
+    joints: wp.array(dtype=wp.int32),
+    L_bb: wp.array3d(dtype=wp.float32),
+    Y: wp.array3d(dtype=wp.float32),
+):
+    """Solve ``M_bb @ y = rhs`` per (env, column) via the pre-factored ``L_bb``.
+
+    Columns ``0..n-1`` use ``rhs = M[base_row, 6 + joints[c]]`` (base-to-actuated
+    coupling, giving ``Y[:, :, :n] = M_bb^{-1} M_ba``); column ``n`` uses the base
+    bias ``rhs = C_b (+ g_b)`` (giving ``Y[:, :, n] = M_bb^{-1} C_b``). The base rows
+    keep their gravity term in every gravity mode — the base is unactuated and
+    uncompensated, so the elimination must see its true load.
+
+    Args:
+        mass_matrix: PhysX generalized mass matrix. Shape is
+            (num_instances, 6 + num_joints, 6 + num_joints).
+        coriolis: Coriolis/centrifugal compensation forces. Shape is (num_instances, 6 + num_joints).
+        gravity: Gravity compensation forces. Pass ``coriolis`` again when unused. Shape is
+            (num_instances, 6 + num_joints).
+        base_has_gravity: ``1`` to add gravity to the base bias rows, ``0`` when gravity is
+            disabled on the robot.
+        joints: Articulation-local joint index of each actuator DOF. Shape is (num_actuator_dofs,).
+        L_bb: Lower-triangular Cholesky factors of ``M_bb``. Shape is (num_instances, 6, 6).
+        Y: Output solutions. Shape is (num_instances, 6, num_actuator_dofs + 1).
+    """
+    e, c = wp.tid()
+    n = joints.shape[0]
+    rhs = vec6f()
+    for i in range(6):
+        if c < n:
+            rhs[i] = mass_matrix[e, i, 6 + joints[c]]
+        else:
+            b = coriolis[e, i]
+            if base_has_gravity != 0:
+                b += gravity[e, i]
+            rhs[i] = b
+    y = vec6f()
+    for i in range(6):
+        s = rhs[i]
+        for k in range(i):
+            s = s - L_bb[e, i, k] * y[k]
+        y[i] = s / L_bb[e, i, i]
+    x = vec6f()
+    for ii in range(6):
+        i = 5 - ii
+        s = y[i]
+        for k in range(i + 1, 6):
+            s = s - L_bb[e, k, i] * x[k]
+        x[i] = s / L_bb[e, i, i]
+    for i in range(6):
+        Y[e, i, c] = x[i]
+
+
+@wp.kernel
+def stable_pd_schur_reduce_mass(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    joints: wp.array(dtype=wp.int32),
+    Y: wp.array3d(dtype=wp.float32),
+    out_block: wp.array3d(dtype=wp.float32),
+):
+    """In-place Schur update ``M_eff -= M_ab @ (M_bb^{-1} M_ba)`` on the gathered block.
+
+    ``M_ab[i, b] = mass_matrix[e, 6 + joints[i], b]`` reads the symmetric base coupling
+    directly; must run after :func:`gather_stable_pd_mass_block` and
+    :func:`stable_pd_schur_solve_base`.
+
+    Args:
+        mass_matrix: PhysX generalized mass matrix. Shape is
+            (num_instances, 6 + num_joints, 6 + num_joints).
+        joints: Articulation-local joint index of each actuator DOF. Shape is (num_actuator_dofs,).
+        Y: Base solves from :func:`stable_pd_schur_solve_base`. Shape is
+            (num_instances, 6, num_actuator_dofs + 1).
+        out_block: The controller state's mass matrix, updated in place. Shape is
+            (num_instances, num_actuator_dofs, num_actuator_dofs).
+    """
+    e, i, j = wp.tid()
+    s = float(0.0)
+    for b in range(6):
+        s = s + mass_matrix[e, 6 + joints[i], b] * Y[e, b, j]
+    out_block[e, i, j] = out_block[e, i, j] - s
+
+
+@wp.kernel
+def stable_pd_schur_reduce_bias(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    joints: wp.array(dtype=wp.int32),
+    Y: wp.array3d(dtype=wp.float32),
+    out_bias: wp.array2d(dtype=wp.float32),
+):
+    """In-place Schur update ``bias_eff -= M_ab @ (M_bb^{-1} C_b)`` on the gathered bias.
+
+    Args:
+        mass_matrix: PhysX generalized mass matrix. Shape is
+            (num_instances, 6 + num_joints, 6 + num_joints).
+        joints: Articulation-local joint index of each actuator DOF. Shape is (num_actuator_dofs,).
+        Y: Base solves; column ``num_actuator_dofs`` holds ``M_bb^{-1} C_b``. Shape is
+            (num_instances, 6, num_actuator_dofs + 1).
+        out_bias: The controller state's bias forces, updated in place. Shape is
+            (num_instances, num_actuator_dofs).
+    """
+    e, k = wp.tid()
+    n = joints.shape[0]
+    s = float(0.0)
+    for b in range(6):
+        s = s + mass_matrix[e, 6 + joints[k], b] * Y[e, b, n]
+    out_bias[e, k] = out_bias[e, k] - s
+
+
 """
 Deprecated kernels.
 

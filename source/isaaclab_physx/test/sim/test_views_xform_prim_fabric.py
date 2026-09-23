@@ -106,7 +106,7 @@ def view_factory():
             sim_utils.create_prim(f"/World/Parent_{i}/Child", "Camera", translation=CHILD_OFFSET, stage=stage)
 
         sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=0.01, device=device, use_fabric=True))
-        view = FrameView("/World/Parent_.*/Child", device=device)
+        view = FrameView("/World/Parent_.*/Child", device=device, sync_usd_on_fabric_write=True)
         return ViewBundle(
             view=view,
             get_parent_pos=_get_parent_positions,

@@ -113,12 +113,10 @@ class SceneAsset(HasPose):
         """
         if self._xform_view is None or self._xform_view.count == 0:
             entity = self.scene[self.entity_name]
-            prim_path = (
-                entity.prim_path
-                if isinstance(entity, AssetBaseCfg)
-                else getattr(entity, "_usd_view", entity)._prim_path
-            )
-            self._xform_view = FrameView(prim_path, device=self.scene.device)
+            view = getattr(entity, "_usd_view", entity)
+            prim_path = entity.prim_path if isinstance(entity, AssetBaseCfg) else view._prim_path
+            device = getattr(entity, "device", self.scene.device)
+            self._xform_view = FrameView(prim_path, device=device)
         return self._xform_view
 
     def get_pose(self):

@@ -186,6 +186,7 @@ class ArticulationData(BaseArticulationData):
                 self._body_com_state_w,
                 self._body_com_jacobian_w,
                 self._gravity_compensation_forces,
+                self._coriolis_centrifugal_compensation_forces,
                 self._mass_matrix,
             ]
         )
@@ -215,6 +216,7 @@ class ArticulationData(BaseArticulationData):
                 self._body_state_w,
                 self._body_link_state_w,
                 self._body_com_state_w,
+                self._coriolis_centrifugal_compensation_forces,
             ]
         )
         self._fk_timestamp = -1.0
@@ -242,6 +244,7 @@ class ArticulationData(BaseArticulationData):
                 self._body_com_jacobian_w,
                 self._mass_matrix,
                 self._gravity_compensation_forces,
+                self._coriolis_centrifugal_compensation_forces,
             ]
         )
 
@@ -1216,6 +1219,24 @@ class ArticulationData(BaseArticulationData):
             self._gravity_compensation_forces_ta = ProxyArray(self._gravity_compensation_forces.data)
         return self._gravity_compensation_forces_ta
 
+    @property
+    def coriolis_centrifugal_compensation_forces(self) -> ProxyArray:
+        """See :attr:`isaaclab.assets.BaseArticulationData.coriolis_centrifugal_compensation_forces`.
+
+        Uses :meth:`_refresh_generalized_joint_buffer` for timestamped refresh and
+        joint-axis reordering.
+        """
+        self._refresh_generalized_joint_buffer(
+            self._coriolis_centrifugal_compensation_forces,
+            self._root_view.get_coriolis_and_centrifugal_compensation_forces,
+            ordering_kernels.reorder_generalized_vector_backend_to_user,
+        )
+        if self._coriolis_centrifugal_compensation_forces_ta is None:
+            self._coriolis_centrifugal_compensation_forces_ta = ProxyArray(
+                self._coriolis_centrifugal_compensation_forces.data
+            )
+        return self._coriolis_centrifugal_compensation_forces_ta
+
     """
     Joint state properties.
     """
@@ -1844,6 +1865,11 @@ class ArticulationData(BaseArticulationData):
             self.device,
             wp.float32,
         )
+        self._coriolis_centrifugal_compensation_forces = TimestampedBuffer(
+            (self._num_instances, self._num_joints + num_base_dofs),
+            self.device,
+            wp.float32,
+        )
 
         # Default root pose and velocity
         self._default_root_pose = wp.zeros((self._num_instances), dtype=wp.transformf, device=self.device)
@@ -2110,7 +2136,17 @@ class ArticulationData(BaseArticulationData):
             self._gravity_compensation_forces.data = wp.zeros(
                 self._gravity_compensation_forces.data.shape, dtype=wp.float32, device=self.device
             )
-        reset_timestamps([self._body_com_jacobian_w, self._mass_matrix, self._gravity_compensation_forces])
+            self._coriolis_centrifugal_compensation_forces.data = wp.zeros(
+                self._coriolis_centrifugal_compensation_forces.data.shape, dtype=wp.float32, device=self.device
+            )
+        reset_timestamps(
+            [
+                self._body_com_jacobian_w,
+                self._mass_matrix,
+                self._gravity_compensation_forces,
+                self._coriolis_centrifugal_compensation_forces,
+            ]
+        )
         self._pin_proxy_arrays()
 
     def _pin_proxy_arrays(self) -> None:
@@ -2183,6 +2219,7 @@ class ArticulationData(BaseArticulationData):
         self._body_com_jacobian_w_ta: ProxyArray | None = None
         self._mass_matrix_ta: ProxyArray | None = None
         self._gravity_compensation_forces_ta: ProxyArray | None = None
+        self._coriolis_centrifugal_compensation_forces_ta: ProxyArray | None = None
         # Body properties
         self._body_mass_ta: ProxyArray | None = None
         self._body_inertia_ta: ProxyArray | None = None

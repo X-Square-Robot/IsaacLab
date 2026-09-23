@@ -20,7 +20,7 @@ from isaaclab_newton.cloner.newton_clone_utils import (
 from isaaclab_newton.physics import visualization_builder as visualization_builder_module
 from newton.solvers import SolverMuJoCo
 
-from pxr import Usd, UsdGeom
+from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaaclab.cloner import ClonePlan
 
@@ -61,6 +61,7 @@ class _FakeVisualizationModelBuilder:
             ),
         }
         self.geometry_sources = []
+        self.usd_import_options = []
         self.world_slices = []
         self._current_world = None
 
@@ -76,7 +77,8 @@ class _FakeVisualizationModelBuilder:
         self._current_world = None
 
     def add_usd(self, stage, root_path=None, ignore_paths=None, schema_resolvers=None, **kwargs):
-        del stage, ignore_paths, schema_resolvers, kwargs
+        del ignore_paths, schema_resolvers
+        self.usd_import_options.append(kwargs.copy())
         if root_path is None:
             return {"path_shape_map": {}}
         label_start = len(self.body_label)
@@ -92,6 +94,9 @@ class _FakeVisualizationModelBuilder:
         self._record_world_slice(label_start, len(self.body_label), geometry_start, len(self.geometry_sources))
         return {"path_shape_map": {}}
 
+    def approximate_meshes(self, *args, **kwargs):
+        raise AssertionError(f"visualization shadow builder must not cook collision meshes: {args}, {kwargs}")
+
     def add_builder(self, builder, xform=None):
         del xform
         label_start = len(self.body_label)
@@ -104,6 +109,7 @@ class _FakeVisualizationModelBuilder:
         self.custom_attributes["mujoco:equality_constraint_label"].values.extend(eq_labels)
         self.custom_attributes["mujoco:equality_constraint_world"].values.extend([self._current_world] * len(eq_labels))
         self.geometry_sources.extend(builder.geometry_sources)
+        self.usd_import_options.extend(builder.usd_import_options)
         self._record_world_slice(label_start, len(self.body_label), geometry_start, len(self.geometry_sources))
 
     def labels_for_world(self, world_id, attr):
@@ -422,7 +428,15 @@ class TestVisualizationClonePlan(unittest.TestCase):
         self.assertIs(result, builder)
         self.assertEqual(shadow_entities, [])
         self.assertEqual(registry_groups, [])
-        builder.add_usd.assert_called_once_with(stage, schema_resolvers=["newton", "physx"], ignore_paths=None)
+        builder.add_usd.assert_called_once_with(
+            stage,
+            load_visual_shapes=True,
+            skip_mesh_approximation=True,
+            hide_collision_shapes=True,
+            force_show_colliders=True,
+            schema_resolvers=["newton", "physx"],
+            ignore_paths=None,
+        )
 
     def test_visualization_builder_rejects_clone_plan_without_environment_paths(self):
         """A cloned scene must not be cached as an incomplete single-world model."""
@@ -442,7 +456,7 @@ class TestVisualizationClonePlan(unittest.TestCase):
         ):
             visualization_builder_module.build_visualization_builder_from_stage_envs(stage, [], clone_plan)
 
-    def test_visualization_builder_uses_clone_plan_sources_and_rewrites_labels(self):
+    def test_visualization_builder_uses_clone_plan_sources_without_collision_cooking(self):
         stage = Usd.Stage.CreateInMemory()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         self._define_xform(stage, "/World")
@@ -453,6 +467,11 @@ class TestVisualizationClonePlan(unittest.TestCase):
             self._define_xform(stage, f"{env_path}/Object")
         self._define_xform(stage, "/World/envs/env_0/Object/source_0_visual")
         self._define_xform(stage, "/World/envs/env_1/Object/source_1_visual")
+        collision_mesh = UsdGeom.Mesh.Define(stage, "/World/envs/env_0/Object/collision")
+        UsdPhysics.CollisionAPI.Apply(collision_mesh.GetPrim())
+        UsdPhysics.MeshCollisionAPI.Apply(collision_mesh.GetPrim()).CreateApproximationAttr().Set(
+            UsdPhysics.Tokens.convexDecomposition
+        )
 
         clone_plan = ClonePlan(
             sources=("/World/envs/env_0/Object", "/World/envs/env_1/Object"),
@@ -477,6 +496,12 @@ class TestVisualizationClonePlan(unittest.TestCase):
             [builder.geometry_sources_for_world(i) for i in range(3)],
             [["/World/envs/env_0/Object"], ["/World/envs/env_1/Object"], ["/World/envs/env_0/Object"]],
         )
+        self.assertTrue(builder.usd_import_options)
+        for options in builder.usd_import_options:
+            self.assertTrue(options["load_visual_shapes"])
+            self.assertTrue(options["skip_mesh_approximation"])
+            self.assertTrue(options["hide_collision_shapes"])
+            self.assertTrue(options["force_show_colliders"])
         for attr, suffix in _VIS_LABEL_SUFFIXES.items():
             self.assertEqual(
                 [builder.labels_for_world(i, attr) for i in range(3)],

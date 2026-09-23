@@ -471,7 +471,13 @@ CARTPOLE_EXPLICIT_ACTUATORS = {
 }
 
 
-def _run_anymal_and_cartpole(use_newton_actuators: bool, *, num_steps: int = NUM_STEPS) -> dict:
+def _run_anymal_and_cartpole(
+    use_newton_actuators: bool,
+    *,
+    num_steps: int = NUM_STEPS,
+    anymal_native: bool | None = None,
+    cartpole_native: bool | None = None,
+) -> dict:
     """Spawn ANYmal-C + Cartpole per env (different DOF counts, different base types)."""
     from isaaclab_assets import CARTPOLE_CFG  # noqa: PLC0415
 
@@ -487,10 +493,15 @@ def _run_anymal_and_cartpole(use_newton_actuators: bool, *, num_steps: int = NUM
         for i in range(NUM_ENVS):
             sim_utils.create_prim(f"/World/Env_{i}", "Xform", translation=(i * 6.0, 0, 0))
 
-        anymal_cfg = ANYMAL_C_CFG.replace(actuators=IDEAL_PD_ACTUATORS, prim_path="/World/Env_.*/Anymal")
+        anymal_cfg = ANYMAL_C_CFG.replace(
+            actuators=IDEAL_PD_ACTUATORS,
+            prim_path="/World/Env_.*/Anymal",
+            native_actuators=anymal_native,
+        )
         cartpole_cfg = CARTPOLE_CFG.replace(
             actuators=CARTPOLE_EXPLICIT_ACTUATORS,
             prim_path="/World/Env_.*/Cartpole",
+            native_actuators=cartpole_native,
         )
         # Stand the cartpole well clear of the anymal.
         cartpole_cfg.init_state = cartpole_cfg.init_state.replace(pos=(0.0, 3.0, 2.0))
@@ -517,7 +528,12 @@ def _run_anymal_and_cartpole(use_newton_actuators: bool, *, num_steps: int = NUM
             pos_anymal.append(wp.to_torch(anymal.data.joint_pos).clone())
             pos_cartpole.append(wp.to_torch(cartpole.data.joint_pos).clone())
 
-    return {"joint_pos_anymal": pos_anymal, "joint_pos_cartpole": pos_cartpole}
+    return {
+        "joint_pos_anymal": pos_anymal,
+        "joint_pos_cartpole": pos_cartpole,
+        "anymal_has_newton": anymal._has_newton_actuators,
+        "cartpole_has_newton": cartpole._has_newton_actuators,
+    }
 
 
 class TestHeterogeneousMultiArticulationNewton(unittest.TestCase):
@@ -560,6 +576,19 @@ class TestHeterogeneousMultiArticulationNewton(unittest.TestCase):
                 rtol=1e-3,
                 msg=f"Cartpole joint_pos diverged from Lab path at step {step_i}",
             )
+
+
+def test_per_articulation_native_actuator_selection_newton() -> None:
+    """A native articulation can coexist with a standard Lab articulation."""
+    result = _run_anymal_and_cartpole(
+        use_newton_actuators=True,
+        num_steps=3,
+        anymal_native=True,
+        cartpole_native=False,
+    )
+
+    assert result["anymal_has_newton"] is True
+    assert result["cartpole_has_newton"] is False
 
 
 # ---------------------------------------------------------------------------

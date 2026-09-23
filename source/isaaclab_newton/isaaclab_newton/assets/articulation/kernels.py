@@ -939,6 +939,226 @@ def shift_jacobian_com_to_origin(
     dst[n, b, 5, dof] = omega[2]
 
 
+vec6f = wp.types.vector(length=6, dtype=wp.float32)
+
+
+@wp.kernel
+def stable_pd_feed_mass_matrix(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    joint_armature: wp.array(dtype=wp.float32),
+    art_indices: wp.array(dtype=wp.int32),
+    rows: wp.array2d(dtype=wp.int32),
+    gdofs: wp.array2d(dtype=wp.int32),
+    out_mass_matrix: wp.array3d(dtype=wp.float32),
+):
+    """Gather each env's StablePD joint sub-block of ``M`` and add ``diag(armature)``.
+
+    ``out_mass_matrix[e, i, j] = mass_matrix[art_indices[e], rows[e, i], rows[e, j]]
+    + (i == j) * joint_armature[gdofs[e, i]]``. ``rows`` are articulation-local DOF
+    indices (global DOF minus the articulation's first DOF), so on a floating base
+    the actuated rows land at >= 6 automatically and the base block is skipped.
+
+    Args:
+        mass_matrix: Joint-space mass matrix [kg, kg·m, or kg·m^2, depending on the
+            joint types of the row/column DOFs], shape (articulation_count, max_dofs, max_dofs).
+        joint_armature: Reflected rotor inertia [kg·m^2 or kg, depending on joint type],
+            flat shape (joint_dof_count,).
+        art_indices: Global articulation index per env, shape (num_envs,).
+        rows: Articulation-local DOF row/col per actuated joint, shape (num_envs, n).
+        gdofs: Global DOF index per actuated joint, shape (num_envs, n).
+        out_mass_matrix: ``ControllerStablePD`` State.mass_matrix, shape (num_envs, n, n).
+    """
+    e, i, j = wp.tid()
+    a = art_indices[e]
+    val = mass_matrix[a, rows[e, i], rows[e, j]]
+    if i == j:
+        val = val + joint_armature[gdofs[e, i]]
+    out_mass_matrix[e, i, j] = val
+
+
+@wp.kernel
+def stable_pd_gather_bias(
+    gravity_force: wp.array(dtype=wp.float32),
+    coriolis_force: wp.array(dtype=wp.float32),
+    gdofs: wp.array2d(dtype=wp.int32),
+    gravity_scale: float,
+    out_bias: wp.array2d(dtype=wp.float32),
+):
+    """Gather the Tan 2011 bias ``C = gravity_scale · g(q) + C(q, q̇) q̇`` per env and actuated joint.
+
+    Args:
+        gravity_force: Gravity force g(q) over all model DOFs [N or N·m], shape (joint_dof_count,).
+        coriolis_force: Coriolis force C(q, q̇) q̇ over all model DOFs [N or N·m], shape (joint_dof_count,).
+        gdofs: Global DOF index per actuated joint, shape (num_envs, n).
+        gravity_scale: 1.0 to include g(q) in the bias (``"bias"`` gravity compensation), 0.0 to
+            gather the Coriolis term only (``"feedforward"``/``"none"`` modes).
+        out_bias: ``ControllerStablePD`` State.bias_forces, shape (num_envs, n).
+    """
+    e, k = wp.tid()
+    g = gdofs[e, k]
+    out_bias[e, k] = gravity_scale * gravity_force[g] + coriolis_force[g]
+
+
+@wp.kernel
+def stable_pd_gather_gravity(
+    gravity_force: wp.array(dtype=wp.float32),
+    gdofs: wp.array2d(dtype=wp.int32),
+    n_per_env: int,
+    out_const_effort: wp.array(dtype=wp.float32),
+):
+    """Gather g(q) into a controller's flat constant-effort buffer (feedforward gravity comp).
+
+    Args:
+        gravity_force: Gravity force g(q) over all model DOFs [N or N·m], shape (joint_dof_count,).
+        gdofs: Global DOF index per actuated joint, shape (num_envs, n).
+        n_per_env: Actuated joint count per env (``n``), the flat world stride.
+        out_const_effort: ``ControllerStablePD.const_effort``, env-major flat shape (num_envs · n,).
+    """
+    e, k = wp.tid()
+    out_const_effort[e * n_per_env + k] = gravity_force[gdofs[e, k]]
+
+
+@wp.kernel
+def stable_pd_schur_factor_base(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    art_indices: wp.array(dtype=wp.int32),
+    L_bb: wp.array3d(dtype=wp.float32),
+):
+    """Cholesky-factorize each env's 6x6 floating-base block ``M_bb`` (rows/cols 0..5).
+
+    The free-joint spatial inertia block is symmetric positive definite for any
+    articulation with mass, so the factorization needs no pivoting or regularization.
+
+    Args:
+        mass_matrix: Joint-space mass matrix, shape (articulation_count, max_dofs, max_dofs).
+        art_indices: Global articulation index per env, shape (num_envs,).
+        L_bb: Output lower-triangular factors, shape (num_envs, 6, 6). Upper
+            triangle is never read or written.
+    """
+    e = wp.tid()
+    a = art_indices[e]
+    for j in range(6):
+        s = mass_matrix[a, j, j]
+        for k in range(j):
+            s = s - L_bb[e, j, k] * L_bb[e, j, k]
+        d = wp.sqrt(s)
+        L_bb[e, j, j] = d
+        for i in range(j + 1, 6):
+            t = mass_matrix[a, i, j]
+            for k in range(j):
+                t = t - L_bb[e, i, k] * L_bb[e, j, k]
+            L_bb[e, i, j] = t / d
+
+
+@wp.kernel
+def stable_pd_schur_solve_base(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    gravity_force: wp.array(dtype=wp.float32),
+    coriolis_force: wp.array(dtype=wp.float32),
+    art_indices: wp.array(dtype=wp.int32),
+    rows: wp.array2d(dtype=wp.int32),
+    base_dof_start: wp.array(dtype=wp.int32),
+    L_bb: wp.array3d(dtype=wp.float32),
+    Y: wp.array3d(dtype=wp.float32),
+):
+    """Solve ``M_bb @ y = rhs`` per (env, column) via the pre-factored ``L_bb``.
+
+    Columns ``0..n-1`` use ``rhs = M[base_row, rows[e, c]]`` (base-to-actuated
+    coupling, giving ``Y[:, :, :n] = M_bb^{-1} M_ba``); column ``n`` uses the base
+    bias ``rhs = C_b = g_b + c_b`` (giving ``Y[:, :, n] = M_bb^{-1} C_b``).
+
+    Args:
+        mass_matrix: Joint-space mass matrix, shape (articulation_count, max_dofs, max_dofs).
+        gravity_force: Gravity force over all model DOFs [N or N·m], shape (joint_dof_count,).
+        coriolis_force: Coriolis force over all model DOFs [N or N·m], shape (joint_dof_count,).
+        art_indices: Global articulation index per env, shape (num_envs,).
+        rows: Articulation-local actuated DOF indices, shape (num_envs, n).
+        base_dof_start: Global DOF index of each env's base DOF 0, shape (num_envs,).
+        L_bb: Lower-triangular Cholesky factors of ``M_bb``, shape (num_envs, 6, 6).
+        Y: Output solutions, shape (num_envs, 6, n + 1).
+    """
+    e, c = wp.tid()
+    a = art_indices[e]
+    n = rows.shape[1]
+    rhs = vec6f()
+    for i in range(6):
+        if c < n:
+            rhs[i] = mass_matrix[a, i, rows[e, c]]
+        else:
+            g = base_dof_start[e] + i
+            rhs[i] = gravity_force[g] + coriolis_force[g]
+    y = vec6f()
+    for i in range(6):
+        s = rhs[i]
+        for k in range(i):
+            s = s - L_bb[e, i, k] * y[k]
+        y[i] = s / L_bb[e, i, i]
+    x = vec6f()
+    for ii in range(6):
+        i = 5 - ii
+        s = y[i]
+        for k in range(i + 1, 6):
+            s = s - L_bb[e, k, i] * x[k]
+        x[i] = s / L_bb[e, i, i]
+    for i in range(6):
+        Y[e, i, c] = x[i]
+
+
+@wp.kernel
+def stable_pd_schur_reduce_mass(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    art_indices: wp.array(dtype=wp.int32),
+    rows: wp.array2d(dtype=wp.int32),
+    Y: wp.array3d(dtype=wp.float32),
+    out_mass_matrix: wp.array3d(dtype=wp.float32),
+):
+    """In-place Schur update ``M_eff -= M_ab @ (M_bb^{-1} M_ba)`` on the gathered block.
+
+    ``M_ab[k, b] = mass_matrix[a, rows[e, k], b]`` reads the symmetric base coupling
+    directly; must run after :func:`stable_pd_feed_mass_matrix` and
+    :func:`stable_pd_schur_solve_base`.
+
+    Args:
+        mass_matrix: Joint-space mass matrix, shape (articulation_count, max_dofs, max_dofs).
+        art_indices: Global articulation index per env, shape (num_envs,).
+        rows: Articulation-local actuated DOF indices, shape (num_envs, n).
+        Y: Base solves from :func:`stable_pd_schur_solve_base`, shape (num_envs, 6, n + 1).
+        out_mass_matrix: ``ControllerStablePD`` State.mass_matrix, shape (num_envs, n, n), updated in place.
+    """
+    e, i, j = wp.tid()
+    a = art_indices[e]
+    s = float(0.0)
+    for b in range(6):
+        s = s + mass_matrix[a, rows[e, i], b] * Y[e, b, j]
+    out_mass_matrix[e, i, j] = out_mass_matrix[e, i, j] - s
+
+
+@wp.kernel
+def stable_pd_schur_reduce_bias(
+    mass_matrix: wp.array3d(dtype=wp.float32),
+    art_indices: wp.array(dtype=wp.int32),
+    rows: wp.array2d(dtype=wp.int32),
+    Y: wp.array3d(dtype=wp.float32),
+    out_bias: wp.array2d(dtype=wp.float32),
+):
+    """In-place Schur update ``bias_eff -= M_ab @ (M_bb^{-1} C_b)`` on the gathered bias.
+
+    Args:
+        mass_matrix: Joint-space mass matrix, shape (articulation_count, max_dofs, max_dofs).
+        art_indices: Global articulation index per env, shape (num_envs,).
+        rows: Articulation-local actuated DOF indices, shape (num_envs, n).
+        Y: Base solves; column ``n`` holds ``M_bb^{-1} C_b``, shape (num_envs, 6, n + 1).
+        out_bias: ``ControllerStablePD`` State.bias_forces, shape (num_envs, n), updated in place.
+    """
+    e, k = wp.tid()
+    a = art_indices[e]
+    n = rows.shape[1]
+    s = float(0.0)
+    for b in range(6):
+        s = s + mass_matrix[a, rows[e, k], b] * Y[e, b, n]
+    out_bias[e, k] = out_bias[e, k] - s
+
+
 """
 Deprecated kernels.
 

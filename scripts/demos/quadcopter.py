@@ -98,8 +98,7 @@ def main():
                 count = 0
                 # reset dof state
                 joint_pos, joint_vel = robot.data.default_joint_pos.torch, robot.data.default_joint_vel.torch
-                robot.write_joint_position_to_sim_index(position=joint_pos)
-                robot.write_joint_velocity_to_sim_index(velocity=joint_vel)
+                robot.write_joint_state_to_sim_index(position=joint_pos, velocity=joint_vel)
                 default_root_pose = robot.data.default_root_pose.torch
                 robot.write_root_pose_to_sim_index(root_pose=default_root_pose)
                 default_root_vel = robot.data.default_root_vel.torch

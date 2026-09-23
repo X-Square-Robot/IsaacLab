@@ -150,7 +150,7 @@ def create_newton_rigid_object(
     mock_model = MagicMock()
     mock_model.world_count = num_instances
     mock_model.gravity = wp.array(
-        np.tile(np.array([[0.0, 0.0, -9.81]], dtype=np.float32), (num_instances + 1, 1)),
+        np.tile(np.array([[0.0, 0.0, -9.81]], dtype=np.float32), (num_instances, 1)),
         dtype=wp.vec3f,
         device=device,
     )

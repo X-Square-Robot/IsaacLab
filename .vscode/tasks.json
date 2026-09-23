@@ -15,6 +15,17 @@
             }
         },
         {
+            // setup ty type checker
+            "label": "setup_ty_type_checker",
+            "type": "shell",
+            "linux": {
+                "command": "${workspaceFolder}/isaaclab.sh -p ${workspaceFolder}/.vscode/tools/setup_vscode_for_ty.py"
+            },
+            "windows": {
+                "command": "${workspaceFolder}/isaaclab.bat -p ${workspaceFolder}/.vscode/tools/setup_vscode_for_ty.py"
+            }
+        },
+        {
             // run formatter
             "label": "run_formatter",
             "type": "shell",

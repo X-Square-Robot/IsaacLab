@@ -188,18 +188,17 @@ def spawn_rigid_body_material(prim_path: str, cfg: physics_materials_cfg.RigidBo
     # check if prim is a material
     if not prim.IsA(UsdShade.Material):
         raise ValueError(f"A prim already exists at path: '{prim_path}' but is not a material.")
-
-    # apply the standard UsdPhysics MaterialAPI (always)
+    # retrieve the USD rigid-body api
     if not UsdPhysics.MaterialAPI(prim):
         UsdPhysics.MaterialAPI.Apply(prim)
 
-    # build cfg dict, dropping underscore-prefixed metadata keys and the spawner ``func`` field
-    cfg_dict = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg) if f.name != "func"}
-
-    # All fields routed by the helper: base friction/restitution under ``physics:*``,
-    # PhysX-subclass fields (compliant-contact, combine modes) under ``physxMaterial:*``.
+    # convert to dict
+    cfg_dict = cfg.to_dict()
+    field_names = {field.name for field in dataclasses.fields(cfg)}
+    cfg_dict = {name: value for name, value in cfg_dict.items() if name in field_names}
+    del cfg_dict["func"]
+    # set into the USD / PhysX schemas based on class metadata
     _apply_namespaced_schemas(prim, cfg, cfg_dict)
-
     # return the prim
     return prim
 

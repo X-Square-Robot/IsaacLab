@@ -50,6 +50,9 @@ docker/artifacts/
 
 # Isaac-Sim packman
 _isaac_sim*
+# A checkout left by the former IsaacSim source submodule is not used by the
+# publication pip installation.
+/IsaacSim/
 _repo
 _build
 .lastformat
@@ -77,12 +80,22 @@ _build
 
 # No benchmarks output
 /benchmarks/
+/docs/reports/
 
 # Ruff cache
 **/.ruff_cache/
+uv.lock
+.omc/
+./assets/
+imgui.ini
 
 # Isaac Lab CI environments in native mode
 **/_isaaclab_install_ci_*
 
 # Superpowers (Claude Code plugin artifacts)
 docs/superpowers/
+uv.lock
+
+# Local planning / investigation notes (not part of the repo)
+.planning/
+.omx/

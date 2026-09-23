@@ -219,8 +219,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             # -- joint state
             joint_pos = robot.data.default_joint_pos.torch
             joint_vel = robot.data.default_joint_vel.torch
-            robot.write_joint_position_to_sim_index(position=joint_pos)
-            robot.write_joint_velocity_to_sim_index(velocity=joint_vel)
+            robot.write_joint_state_to_sim_index(position=joint_pos, velocity=joint_vel)
             # clear internal buffers
             scene.reset()
             print("[INFO]: Resetting scene state...")

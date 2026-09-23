@@ -67,6 +67,11 @@ The system has three layers:
    - :attr:`SceneDataProvider.num_envs` — environment count inferred from
      ``/World/envs/env_<id>`` prims.
 
+   Transform and point conversion runs on the backend Warp device. Provider-created
+   output buffers and mappings are allocated there automatically; pre-allocated output
+   arrays and caller-provided mappings must already be on the same device. Move data
+   explicitly before calling the provider when a consumer requires another device.
+
 3. Backend implementations:
 
    - ``PhysxSceneDataBackend`` (internal to :mod:`isaaclab_physx.physics`) wraps PhysX's

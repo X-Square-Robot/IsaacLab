@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import json
 import os
 import re
 import shutil
@@ -33,6 +34,11 @@ def _sanitized_conda_env() -> dict[str, str]:
     env = dict(os.environ)
 
     # Prevent mixed Python stdlib/runtime when the CLI is launched from Isaac Sim's bundled Python.
+    # Popping PYTHONPATH here is also what keeps a stale Isaac Lab base-env hook
+    # (which leaks a cp312 prebundle onto PYTHONPATH) from crashing the child
+    # conda process during plugin import (pydantic_core ABI mismatch). Do NOT
+    # add CONDA_NO_PLUGINS to "harden" this further: the libmamba solver is
+    # itself a plugin, so disabling plugins breaks `conda env create`.
     for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
         env.pop(key, None)
 
@@ -73,13 +79,51 @@ def _get_conda_prefix(env_name: str) -> Path | None:
     Returns:
         Environment path, or ``None`` if it cannot be determined.
     """
-    # Use conda run to get sys.prefix
     env = _sanitized_conda_env()
+
+    # Preferred: resolve via the conda environment registry. This queries conda
+    # directly for the env's on-disk path and never launches the env's Python,
+    # so it is immune to the race right after `conda env create` where
+    # `conda run -n <env> python` transiently falls back to the base interpreter
+    # (which then reports the base prefix and trips the guard below). It is also
+    # cheaper. We still validate the shape (.../envs/<env_name>) before trusting it.
+    result = run_command(["conda", "env", "list", "--json"], capture_output=True, text=True, check=False, env=env)
+    if result.returncode == 0:
+        try:
+            envs = json.loads(result.stdout).get("envs", [])
+        except (json.JSONDecodeError, AttributeError):
+            envs = []
+        for raw in envs:
+            candidate = Path(raw)
+            if candidate.name == env_name and candidate.parent.name == "envs":
+                return candidate
+
+    # Fallback: ask the env's own interpreter for sys.prefix. Kept for setups
+    # where the env lives outside a standard ``envs`` dir (custom envs_dirs) and
+    # thus would not match the shape check above.
     cmd = ["conda", "run", "-n", env_name, "python", "-c", "import sys; print(sys.prefix)"]
     result = run_command(cmd, capture_output=True, text=True, check=False, env=env)
-    if result.returncode == 0:
-        return Path(result.stdout.strip())
-    return None
+    if result.returncode != 0:
+        return None
+
+    prefix = Path(result.stdout.strip())
+    if not prefix.name:
+        return None
+
+    # Guard against resolving to the base environment when a *named* env was
+    # requested. If conda misbehaves (e.g. while poisoned) and reports the base
+    # prefix, writing activation hooks there would leak Isaac Sim's cp312 runtime
+    # onto the base env's PYTHONPATH and break base conda for every future shell.
+    # The hook must only ever land in the target env's own prefix.
+    if prefix.parent.name != "envs" or prefix.name != env_name:
+        print_error(
+            f"Refusing to use resolved conda prefix '{prefix}' for environment '{env_name}': "
+            "it does not look like that environment's own prefix (expected '.../envs/"
+            f"{env_name}'). Skipping hook installation to avoid polluting the base environment."
+        )
+        return None
+
+    return prefix
 
 
 def _create_conda_envhooks_shell(conda_prefix: Path) -> None:
@@ -95,7 +139,9 @@ def _create_conda_envhooks_shell(conda_prefix: Path) -> None:
 
     activate_hook = activate_d / "setenv.sh"
     deactivate_hook = deactivate_d / "unsetenv.sh"
-    isaacsim_setup_conda_env_script = ISAACLAB_ROOT / "_isaac_sim" / "setup_conda_env.sh"
+    isaac_sim_root = ISAACLAB_ROOT / "_isaac_sim"
+    isaacsim_setup_conda_env_script = isaac_sim_root / "setup_conda_env.sh"
+    isaacsim_setup_python_env_script = isaac_sim_root / "setup_python_env.sh"
 
     activate_content = textwrap.dedent(
         f"""\
@@ -113,6 +159,27 @@ def _create_conda_envhooks_shell(conda_prefix: Path) -> None:
         # for Isaac Sim
         if [ -f "{isaacsim_setup_conda_env_script}" ]; then
             source "{isaacsim_setup_conda_env_script}"
+        elif [ -f "{isaacsim_setup_python_env_script}" ]; then
+            # Source builds ship no setup_conda_env.sh: set the vars it would export
+            # and adopt setup_python_env.sh's PYTHONPATH/LD_LIBRARY_PATH. Capture via
+            # a bash subshell because that script derives its dir from BASH_SOURCE,
+            # empty under zsh (a direct source resolves the paths against the cwd).
+            export ISAAC_PATH="{isaac_sim_root}"
+            export CARB_APP_PATH="$ISAAC_PATH/kit"
+            export EXP_PATH="$ISAAC_PATH/apps"
+            eval "$(bash -c '
+                source "$ISAAC_PATH/setup_python_env.sh" >/dev/null 2>&1
+                printf "export PYTHONPATH=%q\\nexport LD_LIBRARY_PATH=%q\\n" \\
+                    "$PYTHONPATH" "$LD_LIBRARY_PATH"
+            ')"
+        fi
+
+        # Defensive: strip any leftover Kit cp3xx stdlib so it never shadows conda's
+        # platform.py (conda-forge version string crashes Isaac's old platform.py).
+        if [ -n "${{PYTHONPATH-}}" ]; then
+            export PYTHONPATH=$(echo "$PYTHONPATH" | tr ':' '\\n' \\
+                | grep -v "_isaac_sim/kit/python/lib/python3" \\
+                | tr '\\n' ':' | sed 's/:$//')
         fi
         """
     )

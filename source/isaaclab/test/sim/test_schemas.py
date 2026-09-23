@@ -221,6 +221,29 @@ def test_max_effort_deprecation_alias(setup_simulation):
 
 
 @pytest.mark.isaacsim_ci
+def test_joint_drive_ensure_drives_exist_authors_minimal_stiffness(setup_simulation):
+    """``ensure_drives_exist`` should activate an authored zero-gain USD drive."""
+    sim, _, _, _, _, _ = setup_simulation
+    stage = sim_utils.get_current_stage()
+
+    cfg = schemas.JointDriveBaseCfg(ensure_drives_exist=True)
+
+    sim_utils.create_prim("/World/Articulation_ensure", prim_type="Xform")
+    sim_utils.create_prim("/World/Articulation_ensure/body0", prim_type="Cube")
+    sim_utils.create_prim("/World/Articulation_ensure/body1", prim_type="Cube")
+    joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/Articulation_ensure/joint_0")
+    drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
+    drive.CreateStiffnessAttr(0.0)
+    drive.CreateDampingAttr(0.0)
+
+    assert schemas.modify_joint_drive_properties.__wrapped__(str(joint.GetPath()), cfg) is True
+
+    authored_stiffness = drive.GetStiffnessAttr().Get()
+    assert authored_stiffness is not None
+    assert authored_stiffness > 0.0
+
+
+@pytest.mark.isaacsim_ci
 def test_joint_drive_base_no_physx_schema_when_max_joint_velocity_unset(setup_simulation):
     """Regression: setting only UsdPhysics drive fields on JointDriveBaseCfg
     must NOT cause PhysxJointAPI to be applied to the prim. Without this,
@@ -1116,8 +1139,8 @@ def _validate_joint_drive_properties_on_prim(prim_path: str, joint_cfg, verbose:
                 assert joint_prim.HasAPI(UsdPhysics.DriveAPI)
                 # iterate over the joint properties
                 for attr_name, attr_value in joint_cfg.__dict__.items():
-                    # skip class metadata and names we know are not present on the USD prim
-                    if attr_name.startswith("_") or attr_name in ["func", "ensure_drives_exist"]:
+                    # skip names we know are not present
+                    if attr_name in ["func", "ensure_drives_exist"]:
                         continue
                     # resolve the drive (linear or angular)
                     drive_model = "linear" if joint_prim.IsA(UsdPhysics.PrismaticJoint) else "angular"

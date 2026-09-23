@@ -14,6 +14,7 @@ import glob
 import logging
 import os
 import re
+import sys
 import time
 import warnings
 from collections.abc import Callable
@@ -394,6 +395,9 @@ class PhysxManager(PhysicsManager):
     _anim_recorder: ClassVar[AnimationRecorder | None] = None
     _callback_exception: ClassVar[Exception | None] = None
 
+    _fabric_skip_substep: ClassVar[int] = 0
+    _fabric_write_on: ClassVar[bool | None] = None
+
     class _SimManagerStub:
         """No-op stub for Isaac Sim APIs expecting simulation_manager_interface."""
 
@@ -423,6 +427,14 @@ class PhysxManager(PhysicsManager):
         _patch_isaacsim_simulation_manager()
 
         from isaaclab.sim.utils.stage import get_current_stage_id
+
+        # Disable Isaac Sim SimulationManager's default callbacks: its warm-start
+        # reloads physics on PLAY and invalidates this manager's simulation views.
+        # (The import-time guard in isaaclab_physx.__init__ misses pre-Kit imports.)
+        isaacsim_module = sys.modules.get("isaacsim.core.simulation_manager")
+        isaacsim_manager = getattr(isaacsim_module, "SimulationManager", None)
+        if isaacsim_manager is not None and isaacsim_manager is not PhysxManager:
+            isaacsim_manager.enable_all_default_callbacks(False)
 
         super().initialize(sim_context)
         cls._stage_id = get_current_stage_id()
@@ -467,6 +479,7 @@ class PhysxManager(PhysicsManager):
     @classmethod
     def reset(cls, soft: bool = False) -> None:
         """Reset the physics simulation."""
+        cls._fabric_skip_substep = 0
         if not soft:
             # Ensure views are created (warmup only happens once per stage)
             if cls._view is None:
@@ -489,6 +502,8 @@ class PhysxManager(PhysicsManager):
     @classmethod
     def forward(cls) -> None:
         """Update articulation kinematics and fabric for rendering."""
+        # re-anchor fabric-skip phase at the render boundary
+        cls._fabric_skip_substep = 0
         sim = PhysicsManager._sim
         if cls._fabric is not None and cls._update_fabric is not None:
             if cls._view is not None and sim is not None and sim.is_playing():
@@ -516,6 +531,15 @@ class PhysxManager(PhysicsManager):
             logger.warning("Animation recording finished. Shutting down.")
             omni.kit.app.get_app().shutdown()
             return
+
+        if getattr(PhysicsManager._cfg, "fabric_skip", False) and cls._fabric is not None:
+            # render consumes only the last substep; edge-flip avoids set_bool churn
+            interval = max(sim.cfg.render_interval, 1)
+            write = cls._fabric_skip_substep % interval == interval - 1
+            if write != cls._fabric_write_on:
+                sim.set_setting("/physics/fabricUpdateTransformations", write)
+                cls._fabric_write_on = write
+            cls._fabric_skip_substep += 1
 
         physx_sim = omni.physx.get_physx_simulation_interface()
         physx_sim.simulate(sim.cfg.dt, 0.0)
@@ -593,6 +617,11 @@ class PhysxManager(PhysicsManager):
 
         # Notify listeners that prims are being deleted (safe now since PhysX is detached)
         cls._event_bus.dispatch_event(IsaacEvents.PRIM_DELETION.value, payload={"prim_path": "/"})
+
+        if cls._fabric_write_on is False and PhysicsManager._sim is not None:
+            PhysicsManager._sim.set_setting("/physics/fabricUpdateTransformations", True)
+        cls._fabric_write_on = None
+        cls._fabric_skip_substep = 0
 
         cls._fabric = None
         cls._update_fabric = None
@@ -772,6 +801,12 @@ class PhysxManager(PhysicsManager):
         )
         render_interval = max(sim_cfg.render_interval, 1)
         sim.set_setting("/persistent/simulation/minFrameRate", steps_per_sec // render_interval)  # type: ignore[union-attr]
+
+        if getattr(cfg, "fabric_skip", False):
+            logger.info(
+                "PhysX fabric-skip enabled: suppressing intermediate-substep Fabric write-back"
+                f" (render_interval={render_interval})."
+            )
 
         # gpu dynamics
         sim_utils.safe_set_attribute_on_usd_prim(

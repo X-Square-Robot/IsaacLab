@@ -299,7 +299,9 @@ class Articulation(BaseArticulation):
             # (implicit DOFs) into ``w.joint_f_2d``, which is what we push
             # to PhysX as the actuation force.
             self._apply_actuator_model_newton()
-            user_effort = self._physx_actuator_wrapper.joint_f_2d
+            user_effort = (
+                self._actuator_effort_sim if self._split_actuator_device else self._physx_actuator_wrapper.joint_f_2d
+            )
             user_pos_target = self._data._joint_pos_target
             user_vel_target = self._data._joint_vel_target
         else:
@@ -1596,28 +1598,28 @@ class Articulation(BaseArticulation):
             (self.num_instances,),
             -1,
             dtype=torch.int32,
-            device=self.device,
+            device=self._actuator_device,
         )
-        env_id_pos[env_ids.to(self.device, dtype=torch.long)] = torch.arange(
+        env_id_pos[env_ids.to(self._actuator_device, dtype=torch.long)] = torch.arange(
             env_ids.shape[0],
             dtype=torch.int32,
-            device=self.device,
+            device=self._actuator_device,
         )
         joint_id_pos = torch.full(
             (self.num_joints,),
             -1,
             dtype=torch.int32,
-            device=self.device,
+            device=self._actuator_device,
         )
-        joint_ids_local = joint_ids.to(self.device, dtype=torch.long)
+        joint_ids_local = joint_ids.to(self._actuator_device, dtype=torch.long)
         joint_id_pos[joint_ids_local] = torch.arange(
             joint_ids.shape[0],
             dtype=torch.int32,
-            device=self.device,
+            device=self._actuator_device,
         )
 
         values_wp = wp.from_torch(
-            values.to(self.device, dtype=torch.float32).contiguous(),
+            values.to(self._actuator_device, dtype=torch.float32).contiguous(),
             dtype=wp.float32,
         )
         env_id_pos_wp = wp.from_torch(env_id_pos, dtype=wp.int32)
@@ -1639,7 +1641,7 @@ class Articulation(BaseArticulation):
                     self.num_joints,
                 ],
                 outputs=[getattr(ctrl, attr)],
-                device=self.device,
+                device=self._actuator_device,
             )
 
     def write_joint_damping_to_sim_mask(
@@ -4412,8 +4414,38 @@ class Articulation(BaseArticulation):
         # ``sync_torque_telemetry`` kernel. ``None`` when no Newton fast path
         # is active.
         self._implicit_dof_mask: wp.array | None = None
+        # CUDA graphs over the Newton-actuator compute and the input-pointer
+        # snapshot they were captured against (see ``_apply_actuator_model_newton``).
+        # Stateful actuators need two graphs (one per double-buffer parity).
+        self._actuator_graphs: list = []
+        self._actuator_graph_warm = False
+        self._actuator_graph_replay_idx = 0
+        self._actuator_graph_input_ptrs: tuple[int, ...] | None = None
+        self._use_actuator_graph = False
+        self._actuator_graph_dual = False
+        self._actuator_device = self.device
+        self._actuator_wp_device = wp.get_device(self.device)
+        self._split_actuator_device = False
+        self._actuator_effort_sim = None
+        self._actuator_joint_stiffness = None
+        self._actuator_joint_damping = None
+        self._actuator_joint_effort_limits = None
+        self._actuator_computed_torque = None
+        self._actuator_applied_torque = None
 
-        _use_newton_actuators = getattr(self._sim_cfg, "use_newton_actuators", False)
+        resolve_actuator_settings = getattr(self.cfg, "resolve_newton_actuator_settings", None)
+        if callable(resolve_actuator_settings):
+            (
+                _use_newton_actuators,
+                requested_actuator_device,
+                requested_actuator_graph,
+            ) = resolve_actuator_settings(self._sim_cfg)
+        else:
+            # Compatibility for custom articulation cfg classes from older
+            # Isaac Lab releases that do not expose the per-articulation API.
+            _use_newton_actuators = getattr(self._sim_cfg, "use_newton_actuators", False)
+            requested_actuator_device = getattr(self._sim_cfg, "newton_actuator_device", None)
+            requested_actuator_graph = getattr(self._sim_cfg, "newton_actuator_cuda_graph", None)
 
         if _use_newton_actuators and not _HAS_NEWTON_ACTUATORS:
             logger.warning(
@@ -4434,6 +4466,9 @@ class Articulation(BaseArticulation):
             # Enable the fast path even for all-implicit articulations:
             # PhysX runs PD internally; Lab only forwards targets.
             self._has_newton_actuators = True
+            self._actuator_device = str(requested_actuator_device or self.device)
+            self._actuator_wp_device = wp.get_device(self._actuator_device)
+            self._split_actuator_device = self._actuator_wp_device != wp.get_device(self.device)
 
             # Author Newton actuator prims only if any explicit Lab group exists.
             has_explicit = any(
@@ -4451,8 +4486,18 @@ class Articulation(BaseArticulation):
             self._physx_actuator_wrapper = PhysxActuatorWrapper.create(
                 num_envs=self.num_instances,
                 num_joints=self.num_joints,
-                device=self.device,
+                device=self._actuator_device,
+                allocate_inputs=self._split_actuator_device,
             )
+
+            if self._split_actuator_device:
+                shape = (self.num_instances, self.num_joints)
+                self._actuator_effort_sim = wp.zeros(shape, dtype=wp.float32, device=self.device)
+                self._actuator_joint_stiffness = wp.zeros(shape, dtype=wp.float32, device=self._actuator_device)
+                self._actuator_joint_damping = wp.zeros(shape, dtype=wp.float32, device=self._actuator_device)
+                self._actuator_joint_effort_limits = wp.zeros(shape, dtype=wp.float32, device=self._actuator_device)
+                self._actuator_computed_torque = wp.zeros(shape, dtype=wp.float32, device=self._actuator_device)
+                self._actuator_applied_torque = wp.zeros(shape, dtype=wp.float32, device=self._actuator_device)
 
             if has_explicit:
                 first_prim = find_first_matching_prim(self.cfg.prim_path)
@@ -4463,7 +4508,7 @@ class Articulation(BaseArticulation):
                     joint_names=self.joint_names,
                     num_envs=self.num_instances,
                     num_joints=self.num_joints,
-                    device=self.device,
+                    device=self._actuator_device,
                     articulation_prim_path=art_prim_path,
                 )
 
@@ -4472,15 +4517,113 @@ class Articulation(BaseArticulation):
                 # whose device pointer is fixed for the articulation's lifetime,
                 # so the views remain valid for every subsequent step.
                 w = self._physx_actuator_wrapper
-                w.joint_q = self._data.joint_pos.warp.reshape(-1)
-                w.joint_qd = self._data.joint_vel.warp.reshape(-1)
-                w.joint_target_pos = self._data.joint_pos_target.warp.reshape(-1)
-                w.joint_target_vel = self._data.joint_vel_target.warp.reshape(-1)
-                w.joint_act = self._data.joint_effort_target.warp.reshape(-1)
+                if not self._split_actuator_device:
+                    w.joint_q = self._data.joint_pos.warp.reshape(-1)
+                    w.joint_qd = self._data.joint_vel.warp.reshape(-1)
+                    w.joint_target_q = self._data.joint_pos_target.warp.reshape(-1)
+                    w.joint_target_qd = self._data.joint_vel_target.warp.reshape(-1)
+                    w.joint_act = self._data.joint_effort_target.warp.reshape(-1)
                 adapter.finalize(w)
                 self.newton_actuator_adapter = adapter
-                self.write_joint_stiffness_to_sim_index(stiffness=0.0, joint_ids=adapter.joint_indices)
-                self.write_joint_damping_to_sim_index(damping=0.0, joint_ids=adapter.joint_indices)
+                # The adapter follows the actuator compute device, while these
+                # parameter writers launch on the PhysX simulation device.
+                # Keep the adapter indices on the accelerator and stage only
+                # the one-time initialization indices back to PhysX.
+                physx_joint_indices = adapter.joint_indices
+                if isinstance(physx_joint_indices, torch.Tensor):
+                    physx_joint_indices = physx_joint_indices.to(device=self.device)
+                self.write_joint_stiffness_to_sim_index(stiffness=0.0, joint_ids=physx_joint_indices)
+                self.write_joint_damping_to_sim_index(damping=0.0, joint_ids=physx_joint_indices)
+
+                # ControllerStablePD (implicit Tan 2011) reads State.mass_matrix each
+                # step; nothing else on the PhysX fast path populates it, so the
+                # implicit solve cancels the PD effort to ~0. Cache the per-actuator
+                # joint slices so _apply_actuator_model_newton can feed PhysX's
+                # generalized mass matrix into each controller state.
+                self._stable_pd_slices = adapter.stable_pd_actuator_slices(0, self.num_joints)
+                if self._stable_pd_slices:
+                    # PhysX prepends 6 root DOFs to the generalized mass matrix and
+                    # the compensation-force vectors on a floating base: joint columns
+                    # shift by 6 and the base block is Schur-eliminated in
+                    # _feed_stable_pd_mass_matrix (mirrors Newton's StablePDFeeder).
+                    self._stable_pd_root_dofs = 0 if self.is_fixed_base else 6
+                    self._stable_pd_joint_wp = [
+                        wp.array(local_joints, dtype=wp.int32, device=self.device)
+                        for _, local_joints in self._stable_pd_slices
+                    ]
+                    # Schur scratch for the floating-base elimination: one shared 6x6
+                    # Cholesky factor per env plus per-actuator solve columns, allocated
+                    # once so the feed never allocates (CUDA-graph capturable).
+                    if self._stable_pd_root_dofs:
+                        self._stable_pd_schur_L = wp.zeros(
+                            (self.num_instances, 6, 6), dtype=wp.float32, device=self.device
+                        )
+                        self._stable_pd_schur_Y = [
+                            wp.zeros(
+                                (self.num_instances, 6, len(local_joints) + 1), dtype=wp.float32, device=self.device
+                            )
+                            for _, local_joints in self._stable_pd_slices
+                        ]
+                    # Gravity handling, per StablePDActuatorCfg.gravity_compensation:
+                    # "bias" feeds g(q) into the implicit SPD bias (partial compensation,
+                    # Newton's ControllerStablePD convention), "feedforward" gathers it
+                    # into the controller's const_effort channel (full weight, effort-
+                    # clamped), "none" drops it. PhysX computes g(q) from scene gravity
+                    # regardless of per-body disable_gravity, so a gravity-disabled robot
+                    # forces "none" everywhere (phantom load, the arm drifts upward) --
+                    # see _feed_stable_pd_mass_matrix.
+                    from isaaclab_newton.actuators import resolve_stable_pd_gravity_modes  # noqa: PLC0415
+
+                    rigid_props = getattr(getattr(self.cfg, "spawn", None), "rigid_props", None)
+                    self._stable_pd_gravity_on = not getattr(rigid_props, "disable_gravity", False)
+                    modes = resolve_stable_pd_gravity_modes(
+                        self._stable_pd_slices, self.cfg.actuators, self.find_joints
+                    )
+                    if not self._stable_pd_gravity_on:
+                        modes = ["none"] * len(modes)
+                    self._stable_pd_gravity_modes = modes
+                    self._stable_pd_const_efforts: list[wp.array | None] = []
+                    self._stable_pd_mass_host: list[wp.array | None] = []
+                    self._stable_pd_bias_host: list[wp.array | None] = []
+                    self._stable_pd_const_effort_host: list[wp.array | None] = []
+                    for (act_idx, _), mode in zip(self._stable_pd_slices, modes):
+                        ctrl = adapter.actuators[act_idx].controller
+                        if mode == "feedforward" and ctrl.const_effort is None:
+                            ctrl.const_effort = wp.zeros_like(ctrl.kp)
+                        self._stable_pd_const_efforts.append(ctrl.const_effort if mode == "feedforward" else None)
+                        ctrl_state = adapter.current_controller_state(act_idx)
+                        if self._split_actuator_device and ctrl_state is not None:
+                            self._stable_pd_mass_host.append(
+                                wp.zeros(ctrl_state.mass_matrix.shape, dtype=wp.float32, device=self.device)
+                                if ctrl_state.mass_matrix is not None
+                                else None
+                            )
+                            self._stable_pd_bias_host.append(
+                                wp.zeros(ctrl_state.bias_forces.shape, dtype=wp.float32, device=self.device)
+                                if ctrl_state.bias_forces is not None
+                                else None
+                            )
+                            self._stable_pd_const_effort_host.append(
+                                wp.zeros(ctrl.const_effort.shape, dtype=wp.float32, device=self.device)
+                                if mode == "feedforward" and ctrl.const_effort is not None
+                                else None
+                            )
+                        else:
+                            self._stable_pd_mass_host.append(None)
+                            self._stable_pd_bias_host.append(None)
+                            self._stable_pd_const_effort_host.append(None)
+
+            # Capture the actuator compute into CUDA graphs whenever every actuator is
+            # graph-safe. Stateful actuators (delay ring buffers, controller scratch)
+            # double-buffer through a host-side pointer swap in the adapter; a single
+            # graph would bake one buffer assignment, so two graphs are captured on
+            # consecutive (opposite-parity) steps and replayed alternately.
+            _adapter = self.newton_actuator_adapter
+            graph_allowed = self._actuator_wp_device.is_cuda and (_adapter is None or _adapter.is_all_graphable)
+            self._use_actuator_graph = (
+                graph_allowed if requested_actuator_graph is None else bool(requested_actuator_graph) and graph_allowed
+            )
+            self._actuator_graph_dual = _adapter is not None and any(a.is_stateful() for a in _adapter.actuators)
 
             for actuator_name, actuator_cfg in self.cfg.actuators.items():
                 cls_type = actuator_cfg.class_type
@@ -4519,12 +4662,12 @@ class Articulation(BaseArticulation):
                 self._implicit_dof_mask, self._implicit_dof_mask_owner = build_implicit_dof_mask(
                     self.actuators,
                     self.num_joints,
-                    self.device,
+                    self._actuator_device,
                 )
                 self._data._sim_bind_joint_computed_effort = wp.zeros(
                     (self.num_instances, self.num_joints),
                     dtype=wp.float32,
-                    device=self.device,
+                    device=self._actuator_device,
                 )
             return
 
@@ -4763,13 +4906,145 @@ class Articulation(BaseArticulation):
         ``_data._computed_torque`` / ``_data._applied_torque`` from the
         resulting buffer. The final ``joint_f_2d`` is what gets pushed to
         PhysX as the actuation force in :meth:`write_data_to_sim`.
+
+        Split into an eager prefix and a capturable body: the PhysX tensor getters
+        the compute consumes cannot be graph-captured (legacy CUDA stream), so
+        :meth:`_refresh_newton_actuator_inputs` refreshes their pointer-stable
+        buffers first; :meth:`_compute_actuator_model_newton` is then pure warp
+        launches on those buffers, captured into a CUDA graph and replayed
+        afterwards (mirrors ``ContactSensor._update_buffers_impl``). The second
+        call captures rather than the first so warp module loads stay out of the
+        capture; a failed capture falls back to eager launches permanently.
+
+        Stateful actuators double-buffer their state through a host-side pointer
+        swap in ``adapter.step``, which a graph bakes. Two graphs are therefore
+        captured on consecutive steps — the swap runs during each capture, so
+        they encode opposite buffer parities — and replayed alternately,
+        reproducing the eager alternation exactly.
+        """
+        input_ptrs = self._refresh_newton_actuator_inputs()
+        if not self._use_actuator_graph:
+            self._compute_actuator_model_newton()
+            self._sync_newton_actuator_outputs()
+            return
+        num_graphs = 2 if self._actuator_graph_dual else 1
+        if len(self._actuator_graphs) < num_graphs:
+            if not self._actuator_graph_warm:
+                self._actuator_graph_warm = True
+                self._compute_actuator_model_newton()
+                self._sync_newton_actuator_outputs()
+                return
+            try:
+                with wp.ScopedCapture(device=self._actuator_wp_device) as capture:
+                    self._compute_actuator_model_newton()
+            except Exception as exc:
+                self._use_actuator_graph = False
+                self._actuator_graphs.clear()
+                logger.warning(
+                    f"Failed to capture the Newton-actuator compute of '{self.cfg.prim_path}' into a"
+                    f" CUDA graph. Falling back to eager kernel launches. Reason: {exc}"
+                )
+                self._compute_actuator_model_newton()
+                self._sync_newton_actuator_outputs()
+                return
+            self._actuator_graph_input_ptrs = input_ptrs
+            self._actuator_graphs.append(capture.graph)
+            if len(self._actuator_graphs) == num_graphs:
+                logger.info(
+                    f"Captured the Newton-actuator compute of '{self.cfg.prim_path}' into {num_graphs} CUDA graph(s)."
+                )
+            wp.capture_launch(self._actuator_graphs[-1])
+            self._sync_newton_actuator_outputs()
+            return
+        graph = self._actuator_graphs[self._actuator_graph_replay_idx]
+        self._actuator_graph_replay_idx = (self._actuator_graph_replay_idx + 1) % num_graphs
+        wp.capture_launch(graph)
+        self._sync_newton_actuator_outputs()
+
+    def _refresh_newton_actuator_inputs(self) -> tuple[int, ...]:
+        """Refresh the PhysX-owned buffers the Newton-actuator compute consumes.
+
+        The PhysX tensor getters run on the legacy CUDA stream and cannot be
+        graph-captured; each refreshes a pointer-stable buffer in place, which is
+        what lets the captured compute graph consume them. A re-backed buffer would
+        silently feed the graph stale data, so a pointer change fails loudly here.
+
+        Returns:
+            The device pointers of the refreshed buffers, in a fixed order.
+        """
+        data = self._data
+        refreshed = [data.joint_pos, data.joint_vel, data.joint_stiffness, data.joint_damping]
+        refreshed.append(data.joint_effort_limits)
+        if getattr(self, "_stable_pd_slices", None):
+            refreshed += [data.joint_armature, data.mass_matrix, data.coriolis_centrifugal_compensation_forces]
+            if self._stable_pd_gravity_on:
+                refreshed.append(data.gravity_compensation_forces)
+        if self._split_actuator_device:
+            w = self._physx_actuator_wrapper
+            wp.copy(w.joint_q_2d, data.joint_pos.warp)
+            wp.copy(w.joint_qd_2d, data.joint_vel.warp)
+            wp.copy(w.joint_target_q_2d, data._joint_pos_target)
+            wp.copy(w.joint_target_qd_2d, data._joint_vel_target)
+            wp.copy(w.joint_act_2d, data._joint_effort_target)
+            wp.copy(self._actuator_joint_stiffness, data.joint_stiffness.warp)
+            wp.copy(self._actuator_joint_damping, data.joint_damping.warp)
+            wp.copy(self._actuator_joint_effort_limits, data.joint_effort_limits.warp)
+            # PhysX analytic M/C/g data is reduced on its native CPU device,
+            # then copied into the current GPU StablePD state before capture/replay.
+            self._feed_stable_pd_mass_matrix()
+            graph_inputs = [
+                w.joint_q_2d,
+                w.joint_qd_2d,
+                w.joint_target_q_2d,
+                w.joint_target_qd_2d,
+                w.joint_act_2d,
+                self._actuator_joint_stiffness,
+                self._actuator_joint_damping,
+                self._actuator_joint_effort_limits,
+            ]
+            ptrs = tuple(array.ptr for array in graph_inputs)
+        else:
+            ptrs = tuple(p.warp.ptr for p in refreshed)
+        if self._actuator_graphs and ptrs != self._actuator_graph_input_ptrs:
+            raise RuntimeError(
+                "A PhysX buffer consumed by the captured Newton-actuator CUDA graph was re-allocated."
+                " The captured graph requires pointer-stable buffers refreshed in place."
+            )
+        return ptrs
+
+    def _sync_newton_actuator_outputs(self) -> None:
+        """Copy split-device actuator effort and telemetry back to PhysX CPU."""
+
+        if not self._split_actuator_device:
+            return
+        w = self._physx_actuator_wrapper
+        wp.copy(self._actuator_effort_sim, w.joint_f_2d)
+        wp.copy(self._data._computed_torque, self._actuator_computed_torque)
+        wp.copy(self._data._applied_torque, self._actuator_applied_torque)
+        # CPU PhysX consumes effort immediately after this method returns.
+        wp.synchronize_device(self._actuator_wp_device)
+
+    def _compute_actuator_model_newton(self):
+        """Capturable compute body behind :meth:`_apply_actuator_model_newton`.
+
+        Must contain only warp launches / device copies into preallocated arrays:
+        no PhysX tensor reads, no allocations, no branching on GPU data.
         """
         from isaaclab_newton.actuators import kernels as actuator_kernels  # noqa: PLC0415
 
         w = self._physx_actuator_wrapper
-        w.joint_f_2d.assign(self._data._joint_effort_target)
+        if self._split_actuator_device:
+            w.joint_f_2d.assign(w.joint_act_2d)
+        else:
+            w.joint_f_2d.assign(self._data._joint_effort_target)
+        # Feed M and the RNEA bias into ControllerStablePD before it solves
+        # (see _feed_stable_pd_mass_matrix). Split-device feeds happen in
+        # the eager refresh prefix because their CPU kernels/copies cannot be
+        # part of the CUDA graph.
+        if not self._split_actuator_device:
+            self._feed_stable_pd_mass_matrix()
         if self.newton_actuator_adapter is not None:
-            if self.data.has_joint_ordering:
+            if self.data.has_joint_ordering and not self._split_actuator_device:
                 # ``w.joint_q``/``w.joint_qd`` were bound once (at actuator setup) to
                 # ``_data.joint_pos``/``_data.joint_vel``. With identity ordering those
                 # bindings alias PhysX-owned memory directly and are always current. With
@@ -4782,17 +5057,38 @@ class Articulation(BaseArticulation):
                 self._data._refresh_joint_vel()
             self.newton_actuator_adapter.step(w, w, SimulationManager.get_physics_dt())
 
+        if self._split_actuator_device:
+            joint_pos = w.joint_q_2d
+            joint_vel = w.joint_qd_2d
+            joint_pos_target = w.joint_target_q_2d
+            joint_vel_target = w.joint_target_qd_2d
+            joint_stiffness = self._actuator_joint_stiffness
+            joint_damping = self._actuator_joint_damping
+            joint_effort_limits = self._actuator_joint_effort_limits
+            computed_torque = self._actuator_computed_torque
+            applied_torque = self._actuator_applied_torque
+        else:
+            joint_pos = self._data.joint_pos.warp
+            joint_vel = self._data.joint_vel.warp
+            joint_pos_target = self._data._joint_pos_target
+            joint_vel_target = self._data._joint_vel_target
+            joint_stiffness = self._data.joint_stiffness.warp
+            joint_damping = self._data.joint_damping.warp
+            joint_effort_limits = self._data.joint_effort_limits.warp
+            computed_torque = self._data._computed_torque
+            applied_torque = self._data._applied_torque
+
         wp.launch(
             actuator_kernels.sync_torque_telemetry,
             dim=(self.num_instances, self.num_joints),
             inputs=[
-                self._data.joint_pos.warp,
-                self._data.joint_vel.warp,
-                self._data._joint_pos_target,
-                self._data._joint_vel_target,
-                self._data.joint_stiffness.warp,
-                self._data.joint_damping.warp,
-                self._data.joint_effort_limits.warp,
+                joint_pos,
+                joint_vel,
+                joint_pos_target,
+                joint_vel_target,
+                joint_stiffness,
+                joint_damping,
+                joint_effort_limits,
                 self._implicit_dof_mask,
                 w.joint_f_2d,
                 self._data._sim_bind_joint_computed_effort,
@@ -4800,11 +5096,138 @@ class Articulation(BaseArticulation):
                 False,
             ],
             outputs=[
-                self._data._computed_torque,
-                self._data._applied_torque,
+                computed_torque,
+                applied_torque,
             ],
-            device=self.device,
+            device=self._actuator_device,
         )
+
+    def _feed_stable_pd_mass_matrix(self) -> None:
+        """Populate each ``ControllerStablePD`` state's mass matrix and bias from PhysX.
+
+        The implicit SPD solve reads ``State.mass_matrix`` every step; without it
+        the solve cancels the PD effort to ~0 and StablePD applies no torque. PhysX
+        exposes the generalized mass matrix via ``data.mass_matrix``
+        (``get_generalized_mass_matrices``); this slices each actuator's symmetric
+        joint sub-block into its controller state, broadcast over envs. No-op unless
+        this articulation has StablePD actuators.
+
+        On a floating base PhysX prepends 6 root DOFs to the generalized matrix and
+        vectors, so joint columns shift by 6 and the unactuated base block is
+        Schur-eliminated (``M_eff = M_aa - M_ab M_bb^-1 M_ba``, same for the bias) --
+        the exact elimination of the base accelerations from the implicit solve,
+        mirroring Newton's ``StablePDFeeder``.
+
+        ``bias_forces`` receives ``C(q, q̇) q̇`` plus, per the actuator's
+        ``gravity_compensation`` mode, ``g(q)`` -- both from PhysX's analytic
+        inverse-dynamics queries, the same quantities Newton's
+        ``eval_inverse_dynamics`` feeds, no finite differencing needed. ``"bias"``
+        folds ``g(q)`` into the implicit bias (scaled by the solve, hence partial --
+        Newton's ``ControllerStablePD`` convention); ``"feedforward"`` gathers it into
+        the controller's ``const_effort`` channel instead (full weight, effort-clamped,
+        outside the implicit solve); ``"none"`` drops it. On a floating base the 6 base
+        rows keep their gravity term in every mode -- the base is unactuated and
+        uncompensated, so the Schur elimination must see its true load. When gravity is
+        disabled on the robot's rigid bodies every mode collapses to ``"none"`` and the
+        base rows drop gravity too: PhysX computes ``g(q)`` from scene gravity
+        regardless of the per-body flag, so it is a phantom load the plant never feels
+        (feeding it makes the arm drift upward).
+
+        M enables StablePD torque (the implicit solve cancels the PD effort to zero
+        without it) and is not gravity compensation, so it is fed whenever StablePD
+        is active, regardless of gravity.
+
+        Pure warp launches into preallocated buffers (armature is folded into the
+        gathered diagonal, which commutes with the Schur subtraction), so the whole
+        feed is CUDA-graph capturable on both base types -- the kernel counterpart
+        of Newton's ``StablePDFeeder.feed``.
+        """
+        slices = getattr(self, "_stable_pd_slices", None)
+        if not slices or self.newton_actuator_adapter is None:
+            return
+        b = self._stable_pd_root_dofs  # 6 root DOFs prepended on a floating base, else 0
+        mass_matrix = self.data.mass_matrix.warp  # (num_instances, b + num_joints, b + num_joints)
+        armature = self.data.joint_armature.warp  # (num_instances, num_joints)
+        # bias = C(q,q̇)q̇, plus g(q) per the actuator's gravity mode (RNEA sign matches
+        # ControllerStablePD's RHS, no negation) -- see docstring for the gravity gating.
+        coriolis = self.data.coriolis_centrifugal_compensation_forces.warp  # (num_instances, b + num_joints)
+        # The kernels need a valid array either way; they only read gravity when told to.
+        gravity = self.data.gravity_compensation_forces.warp if self._stable_pd_gravity_on else coriolis
+        base_has_gravity = 1 if self._stable_pd_gravity_on else 0
+        if b:
+            # M_bb is shared by every actuator slice: factorize once per feed.
+            wp.launch(
+                articulation_kernels.stable_pd_schur_factor_base,
+                dim=self.num_instances,
+                inputs=[mass_matrix],
+                outputs=[self._stable_pd_schur_L],
+                device=self.device,
+            )
+        for i, ((act_idx, _), joints_wp, mode, const_effort) in enumerate(
+            zip(slices, self._stable_pd_joint_wp, self._stable_pd_gravity_modes, self._stable_pd_const_efforts)
+        ):
+            ctrl_state = self.newton_actuator_adapter.current_controller_state(act_idx)
+            if ctrl_state is None or ctrl_state.mass_matrix is None:
+                continue
+            mass_out = self._stable_pd_mass_host[i] if self._split_actuator_device else ctrl_state.mass_matrix
+            bias_out = self._stable_pd_bias_host[i] if self._split_actuator_device else ctrl_state.bias_forces
+            const_effort_out = self._stable_pd_const_effort_host[i] if self._split_actuator_device else const_effort
+            n = joints_wp.shape[0]
+            wp.launch(
+                articulation_kernels.gather_stable_pd_mass_block,
+                dim=(self.num_instances, n, n),
+                inputs=[mass_matrix, armature, joints_wp, b],
+                outputs=[mass_out],
+                device=self.device,
+            )
+            has_bias = bias_out is not None
+            if has_bias:
+                wp.launch(
+                    articulation_kernels.gather_stable_pd_bias,
+                    dim=(self.num_instances, n),
+                    inputs=[coriolis, gravity, 1 if mode == "bias" and self._stable_pd_gravity_on else 0, joints_wp, b],
+                    outputs=[bias_out],
+                    device=self.device,
+                )
+            if mode == "feedforward" and self._stable_pd_gravity_on and const_effort_out is not None:
+                wp.launch(
+                    articulation_kernels.gather_stable_pd_const_effort,
+                    dim=(self.num_instances, n),
+                    inputs=[gravity, joints_wp, b],
+                    outputs=[const_effort_out],
+                    device=self.device,
+                )
+            if b:
+                # Schur-eliminate the unactuated base block (see docstring):
+                # solve M_bb Y = [M_ba | C_b] once, then reduce M and the bias.
+                wp.launch(
+                    articulation_kernels.stable_pd_schur_solve_base,
+                    dim=(self.num_instances, n + 1),
+                    inputs=[mass_matrix, coriolis, gravity, base_has_gravity, joints_wp, self._stable_pd_schur_L],
+                    outputs=[self._stable_pd_schur_Y[i]],
+                    device=self.device,
+                )
+                wp.launch(
+                    articulation_kernels.stable_pd_schur_reduce_mass,
+                    dim=(self.num_instances, n, n),
+                    inputs=[mass_matrix, joints_wp, self._stable_pd_schur_Y[i]],
+                    outputs=[mass_out],
+                    device=self.device,
+                )
+                if has_bias:
+                    wp.launch(
+                        articulation_kernels.stable_pd_schur_reduce_bias,
+                        dim=(self.num_instances, n),
+                        inputs=[mass_matrix, joints_wp, self._stable_pd_schur_Y[i]],
+                        outputs=[bias_out],
+                        device=self.device,
+                    )
+            if self._split_actuator_device:
+                wp.copy(ctrl_state.mass_matrix, mass_out)
+                if ctrl_state.bias_forces is not None and bias_out is not None:
+                    wp.copy(ctrl_state.bias_forces, bias_out)
+                if const_effort is not None and const_effort_out is not None:
+                    wp.copy(const_effort, const_effort_out)
 
     """
     Internal helpers -- Debugging.

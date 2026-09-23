@@ -29,6 +29,35 @@ _APPROXIMATION_TO_REMESHING_METHOD = {
 }
 
 
+def _approximate_shape_preserving_collision_filters(
+    builder: ModelBuilder, shape: int, method: str, *, keep_visual_shapes: bool
+) -> None:
+    """Approximate one mesh and copy its explicit filters to new collision parts."""
+    filtered_neighbors = {
+        shape_b if shape_a == shape else shape_a
+        for shape_a, shape_b in builder.shape_collision_filter_pairs
+        if shape_a == shape or shape_b == shape
+    }
+    first_new_shape = builder.shape_count
+    builder.approximate_meshes(method, shape_indices=[shape], keep_visual_shapes=keep_visual_shapes)
+
+    new_collision_shapes = [
+        new_shape
+        for new_shape in range(first_new_shape, builder.shape_count)
+        if builder.shape_flags[new_shape] & ShapeFlags.COLLIDE_SHAPES
+    ]
+    if not new_collision_shapes or not filtered_neighbors:
+        return
+
+    existing_pairs = {tuple(sorted(pair)) for pair in builder.shape_collision_filter_pairs}
+    for new_shape in new_collision_shapes:
+        for neighbor in filtered_neighbors:
+            pair = tuple(sorted((new_shape, neighbor)))
+            if pair not in existing_pairs:
+                builder.add_shape_collision_filter_pair(*pair)
+                existing_pairs.add(pair)
+
+
 def _authored_collision_approximations(stage: Usd.Stage) -> dict[str, str]:
     """Prim path -> authored ``physics:approximation`` token (lower case).
 
@@ -53,7 +82,7 @@ def _apply_authored_approximations(builder: ModelBuilder, path_shape_map: dict, 
         authored_shape_indices.add(index)
         method = _APPROXIMATION_TO_REMESHING_METHOD.get(mode)
         if method is not None:
-            builder.approximate_meshes(method, shape_indices=[index], keep_visual_shapes=True)
+            _approximate_shape_preserving_collision_filters(builder, index, method, keep_visual_shapes=True)
     return authored_shape_indices
 
 
@@ -146,6 +175,7 @@ def build_source_builders(
     *,
     ignore_paths: Sequence[str] | None = None,
     simplify_meshes: bool = True,
+    visualization_only: bool = False,
     load_visual_shapes: bool = True,
 ) -> dict[str, ModelBuilder]:
     """Build one Newton builder for each clone source prim path.
@@ -155,6 +185,11 @@ def build_source_builders(
     honored modes leave multiple sources with differing shape-type sequences (e.g.
     heterogeneous asset variants), every mesh falls back to the uniform convex-hull
     treatment, because :class:`SolverMuJoCo` requires homogeneous worlds.
+
+    When ``visualization_only`` is enabled, collision meshes remain unprocessed,
+    colliders are hidden on bodies that already have visual geometry, and collider-only
+    bodies keep their original mesh visible. This mode is intended for shadow models
+    whose body poses are driven by another physics backend.
 
     Args:
         stage: USD stage containing the source prims.
@@ -167,10 +202,19 @@ def build_source_builders(
             USD parse time and memory that only pays off when the shapes are rendered
             or ray cast.
     """
-    authored = _authored_collision_approximations(stage)
+    authored = {} if visualization_only else _authored_collision_approximations(stage)
+    simplify_collision_meshes = simplify_meshes and not visualization_only
     builders = {
         source: _build_source_builder(
-            stage, source, create_builder, schema_resolvers, ignore_paths, simplify_meshes, authored, load_visual_shapes
+            stage,
+            source,
+            create_builder,
+            schema_resolvers,
+            ignore_paths,
+            simplify_collision_meshes,
+            authored,
+            load_visual_shapes,
+            force_show_colliders=visualization_only,
         )
         for source in sources
     }
@@ -192,9 +236,10 @@ def build_source_builders(
                     create_builder,
                     schema_resolvers,
                     ignore_paths,
-                    simplify_meshes,
+                    simplify_collision_meshes,
                     {},
                     load_visual_shapes,
+                    force_show_colliders=visualization_only,
                 )
                 for source in sources
             }
@@ -210,8 +255,10 @@ def _build_source_builder(
     simplify_meshes: bool,
     authored: dict[str, str],
     load_visual_shapes: bool = True,
+    *,
+    force_show_colliders: bool = False,
 ) -> ModelBuilder:
-    """Build one source builder; an empty ``authored`` map restores hull-everything."""
+    """Build one source builder and optionally post-process its collision meshes."""
     builder = create_builder()
     solvers.SolverMuJoCo.register_custom_attributes(builder)
     solvers.SolverKamino.register_custom_attributes(builder)
@@ -221,6 +268,7 @@ def _build_source_builder(
         load_visual_shapes=load_visual_shapes,
         hide_collision_shapes=True,
         skip_mesh_approximation=True,
+        force_show_colliders=force_show_colliders,
         schema_resolvers=schema_resolvers,
         ignore_paths=ignore_paths,
     )

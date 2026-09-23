@@ -149,6 +149,18 @@ def test_version_single_source_matches_literal_pins():
     assert warp_spec in dependencies
 
 
+def test_internal_newton_uses_project_runtime_requirements():
+    """The internal Newton branch must use the project-selected runtime versions."""
+    pyproject = _root_pyproject()
+    versions = pyproject["tool"]["isaaclab"]["versions"]
+    overrides = pyproject["tool"]["uv"]["override-dependencies"]
+
+    assert versions["newton"] == "publication"
+    assert versions["warp"] == ">=1.16.0"
+    assert "mujoco~=3.11.0" in overrides
+    assert "mujoco-warp~=3.11.0" in overrides
+
+
 def test_public_ov_packages_use_public_pypi_index():
     """Public OV packages must not resolve from the NVIDIA package index."""
     pyproject = _root_pyproject()

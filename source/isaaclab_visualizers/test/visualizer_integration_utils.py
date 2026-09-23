@@ -665,8 +665,17 @@ def _select_newton_training_control_button(viewer, target_label: str) -> None:
         def text(self, _text):
             pass
 
+        def same_line(self):
+            pass
+
         def button(self, label):
             return label == target_label
+
+        def begin_disabled(self, _disabled):
+            pass
+
+        def end_disabled(self):
+            pass
 
         def slider_int(self, _label, value, _min_value, _max_value, _format):
             return False, value
@@ -681,9 +690,26 @@ def _select_newton_training_control_button(viewer, target_label: str) -> None:
 
 
 def _select_newton_pause_simulation_button(viewer) -> None:
-    """Trigger the Newton visualizer's Pause/Resume Simulation UI button."""
-    label = "Resume Simulation" if viewer.is_training_paused() else "Pause Simulation"
-    _select_newton_training_control_button(viewer, label)
+    """Toggle the Newton visualizer's native Pause checkbox."""
+
+    class _FakeImgui:
+        def checkbox(self, label, value):
+            assert label == "Pause"
+            return True, not value
+
+        def same_line(self):
+            pass
+
+        def button(self, _label):
+            return False
+
+        def begin_disabled(self, _disabled):
+            pass
+
+        def end_disabled(self):
+            pass
+
+    viewer._render_simulation_controls(_FakeImgui())
 
 
 def _set_newton_simulation_paused(viewer, paused: bool) -> None:

@@ -56,7 +56,7 @@ class TestGetPipCommand:
             ),
         ):
             result = get_pip_command(python_exe=fake_python)
-            assert result == ["uv", "pip"]
+            assert result == ["uv", "--preview-features", "extra-build-dependencies", "pip"]
 
     def test_returns_uv_pip_in_venv_with_uv(self, tmp_path):
         """When VIRTUAL_ENV is set and uv is on PATH, always return uv pip."""
@@ -67,7 +67,7 @@ class TestGetPipCommand:
             mock.patch("isaaclab.cli.utils.shutil.which", return_value="/usr/bin/uv"),
         ):
             result = get_pip_command(python_exe=fake_python)
-            assert result == ["uv", "pip"]
+            assert result == ["uv", "--preview-features", "extra-build-dependencies", "pip"]
 
     def test_returns_python_pip_without_uv(self, tmp_path):
         """When uv is not installed, always return python -m pip."""
@@ -122,7 +122,10 @@ class TestExtractPythonExe:
         env = os.environ.copy()
         env.pop("VIRTUAL_ENV", None)
         env["CONDA_PREFIX"] = str(tmp_path)
-        with mock.patch.dict(os.environ, env, clear=True):
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch("isaaclab.cli.utils._python_minor_version", return_value="3.12"),
+        ):
             result = extract_python_exe()
             assert Path(result) == conda_python
 
@@ -264,7 +267,10 @@ class TestEnsureNewton:
         install_cmds = [cmd for cmd in calls if "install" in cmd]
         assert install_cmds, "expected a pip install call"
         install_args = install_cmds[-1]
-        assert any(arg.startswith("newton[sim,importers]") and arg.endswith(commit) for arg in install_args)
+        assert any(
+            install._requirement_name(arg) == "newton" and "[sim,importers]" in arg and arg.endswith(commit)
+            for arg in install_args
+        )
         assert any(arg.startswith("newton-usd-schemas") for arg in install_args), "schemas must be forced too"
 
     def test_skips_when_commit_already_installed(self):

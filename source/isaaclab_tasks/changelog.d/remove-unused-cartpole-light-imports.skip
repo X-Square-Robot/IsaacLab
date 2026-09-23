@@ -1,0 +1,4 @@
+Internal cleanup: removed the unused ``CARTPOLE_DISTANT_LIGHT_*`` constant
+imports from ``core/cartpole/cartpole_direct_camera_env.py`` and
+``core/cartpole/cartpole_manager_env_cfg.py``. The constants remain defined in
+``core/cartpole/constants.py``. No user-facing change.

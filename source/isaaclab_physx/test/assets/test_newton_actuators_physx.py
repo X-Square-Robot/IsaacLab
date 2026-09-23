@@ -635,6 +635,43 @@ class TestHeterogeneousMultiArticulationPhysx(unittest.TestCase):
             )
 
 
+def test_per_articulation_native_actuator_selection_physx() -> None:
+    """Honor an articulation opt-out while another asset uses Newton actuators."""
+    from isaaclab_assets import CARTPOLE_CFG
+
+    sim_cfg = SimulationCfg(dt=DT, physics=PhysxCfg(), use_newton_actuators=True)
+    with build_simulation_context(
+        device="cuda:0",
+        gravity_enabled=True,
+        add_ground_plane=True,
+        sim_cfg=sim_cfg,
+    ) as sim:
+        sim._app_control_on_stop_handle = None
+        for i in range(NUM_ENVS):
+            sim_utils.create_prim(f"/World/Env_{i}", "Xform", translation=(i * 6.0, 0, 0))
+
+        native_cfg = ANYMAL_C_CFG.replace(
+            actuators=IDEAL_PD_ACTUATORS,
+            prim_path="/World/Env_.*/NativeRobot",
+            native_actuators=True,
+        )
+        lab_cfg = CARTPOLE_CFG.replace(
+            actuators=CARTPOLE_EXPLICIT_ACTUATORS,
+            prim_path="/World/Env_.*/PhysxOnlyCartpole",
+            native_actuators=False,
+        )
+        lab_cfg.init_state = lab_cfg.init_state.replace(pos=(0.0, 3.0, 2.0))
+
+        native_articulation = Articulation(native_cfg)
+        lab_articulation = Articulation(lab_cfg)
+        sim.reset()
+
+        assert native_articulation._has_newton_actuators is True
+        assert native_articulation.newton_actuator_adapter is not None
+        assert lab_articulation._has_newton_actuators is False
+        assert lab_articulation.newton_actuator_adapter is None
+
+
 # ---------------------------------------------------------------------------
 # Domain randomization via events.py — PhysX backend
 # ---------------------------------------------------------------------------

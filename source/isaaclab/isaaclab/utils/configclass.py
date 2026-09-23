@@ -465,10 +465,7 @@ def _process_mutable_types(cls):
         # ``from __future__ import annotations`` turns annotations into strings, so we
         # also detect the string form (``"ClassVar[...]"``) for files using PEP 563.
         ann_value = ann[key]
-        if isinstance(ann_value, str) and ann_value.startswith(("ClassVar", "typing.ClassVar")):
-            continue
-        origin = getattr(ann_value, "__origin__", None)
-        if origin is ClassVar:
+        if _is_classvar_annotation(ann_value):
             continue
         # check if f is MISSING
         # note: commented out for now since it causes issue with inheritance
@@ -496,12 +493,23 @@ def _custom_post_init(obj):
         # skip dunder members
         if key.startswith("__"):
             continue
+        # ClassVar metadata is read from the class MRO by schema writers.  When
+        # ``from __future__ import annotations`` stores ``ClassVar[...]`` as a string,
+        # ``dataclasses`` correctly excludes it from fields, but the old post-init loop
+        # still deep-copied the class attribute onto the instance.  That polluted
+        # ``cfg.__dict__`` with private ``_usd_*`` keys and made legacy validators try
+        # to author nonexistent USD attributes.
+        if _is_classvar_annotation(_find_annotation_in_mro(type(obj), key)):
+            continue
+        # Check class members before property access so inherited compatibility
+        # properties are not evaluated and then written back as instance fields.
+        ann = _find_class_member_in_mro(type(obj), key)
+        if isinstance(ann, property):
+            continue
         # get data member
         value = getattr(obj, key)
-        # check annotation
-        ann = obj.__class__.__dict__.get(key)
         # duplicate data members that are mutable
-        if not callable(value) and not isinstance(ann, property):
+        if not callable(value):
             copied_value = deepcopy(value)
             setattr(obj, key, _wrap_resolvable_strings(copied_value, module_dir=_field_module_dir(obj, key)))
 
@@ -528,6 +536,37 @@ def _combined_function(f1: Callable, f2: Callable) -> Callable:
 """
 Helper functions
 """
+
+
+def _find_annotation_in_mro(cls: type, key: str) -> Any:
+    """Return the nearest annotation for ``key`` in the class MRO."""
+    for mro_cls in cls.__mro__:
+        annotations = mro_cls.__dict__.get("__annotations__", {})
+        if key in annotations:
+            return annotations[key]
+    return None
+
+
+def _find_class_member_in_mro(cls: type, key: str) -> Any:
+    """Return the nearest class member for ``key`` in the class MRO."""
+    for mro_cls in cls.__mro__:
+        if key in mro_cls.__dict__:
+            return mro_cls.__dict__[key]
+    return MISSING
+
+
+def _is_classvar_annotation(annotation: Any) -> bool:
+    """Return True when an annotation denotes :class:`typing.ClassVar`.
+
+    Python stores annotations as strings under ``from __future__ import annotations``.
+    The configclass decorator must treat both runtime and string forms as class-only
+    metadata so private schema routing fields never become instance state.
+    """
+    if annotation is None:
+        return False
+    if isinstance(annotation, str):
+        return annotation.startswith(("ClassVar", "typing.ClassVar"))
+    return getattr(annotation, "__origin__", None) is ClassVar
 
 
 def _skippable_class_member(key: str, value: Any, hints: dict | None = None) -> bool:

@@ -49,9 +49,44 @@ class NewtonMJWarpManager(NewtonManager):
         :attr:`NewtonManager._needs_collision_pipeline` to
         ``True`` only when ``use_mujoco_contacts=False``.
         """
+        # Clamp sliding friction to avoid NaN in MuJoCo's constraint solver
+        # when condim >= 3 (division by friction coefficient).
+        min_mu = solver_cfg.min_friction
+        if min_mu > 0.0 and model.shape_material_mu is not None:
+            mu = model.shape_material_mu.numpy()
+            below = mu < min_mu
+            if below.any():
+                count = int(below.sum())
+                logger.warning(
+                    "Clamping %d geom(s) with friction < %.1e to min_friction=%.1e to prevent MJWarp NaN.",
+                    count,
+                    min_mu,
+                    min_mu,
+                )
+                mu[below] = min_mu
+                model.shape_material_mu.assign(mu)
+
+        if solver_cfg.contact_ke is not None:
+            logger.warning(
+                "Overriding MJWarp contact stiffness for %d geom(s): contact_ke=%g.",
+                model.shape_count,
+                solver_cfg.contact_ke,
+            )
+            cls._assign_numeric_array(model.shape_material_ke, float(solver_cfg.contact_ke))
+        if solver_cfg.contact_kd is not None:
+            logger.warning(
+                "Overriding MJWarp contact damping for %d geom(s): contact_kd=%g.",
+                model.shape_count,
+                solver_cfg.contact_kd,
+            )
+            cls._assign_numeric_array(model.shape_material_kd, float(solver_cfg.contact_kd))
+
         NewtonManager._solver = cls._create_solver(model, solver_cfg)
         NewtonManager._use_single_state = True
         NewtonManager._needs_collision_pipeline = not solver_cfg.use_mujoco_contacts
+
+        if solver_cfg.contact_condim is not None:
+            cls._override_contact_condim(solver_cfg.contact_condim)
 
         cfg = PhysicsManager._cfg
         # Cross-config validation that needs both halves.
@@ -61,6 +96,37 @@ class NewtonMJWarpManager(NewtonManager):
                 "solver_cfg.use_mujoco_contacts=True. Either set "
                 "use_mujoco_contacts=False or remove collision_cfg."
             )
+
+    @staticmethod
+    def _assign_numeric_array(array, value: int | float) -> None:
+        """Assign a scalar into a Newton/MuJoCo array regardless of backend."""
+        if array is None:
+            return
+        if hasattr(array, "fill_"):
+            array.fill_(value)
+            return
+        if hasattr(array, "numpy") and hasattr(array, "assign"):
+            data = array.numpy()
+            data[...] = value
+            array.assign(data)
+            return
+        array[...] = value
+
+    @classmethod
+    def _override_contact_condim(cls, condim: int) -> None:
+        """Force MuJoCo contact dimensionality after solver construction."""
+        if condim < 1 or condim > 6:
+            raise ValueError(f"MJWarp contact_condim must be in [1, 6], got {condim}.")
+
+        solver = NewtonManager._solver
+        geom_count = getattr(getattr(solver, "mj_model", None), "ngeom", 0)
+        logger.warning("Overriding MJWarp contact dimensionality for %d geom(s): condim=%d.", geom_count, condim)
+
+        # MuJoCo CPU and MuJoCo Warp keep separate model buffers. Update both
+        # so initial construction and later property refreshes see the same
+        # normal-only contact setting.
+        cls._assign_numeric_array(getattr(getattr(solver, "mj_model", None), "geom_condim", None), condim)
+        cls._assign_numeric_array(getattr(getattr(solver, "mjw_model", None), "geom_condim", None), condim)
 
     @classmethod
     def _initialize_contacts(cls) -> None:
@@ -106,9 +172,9 @@ class NewtonMJWarpManager(NewtonManager):
         step.
 
         Args:
-            world_mask: Per-world bool mask of shape ``(world_count + 1,)``.
-                Entries before the last select local worlds; the final entry
-                selects global entities in world -1. ``None`` is a no-op.
+            world_mask: Per-world bool mask of shape ``(world_count,)``;
+                ``True`` for worlds that need their MJWarp internals cleared.
+                ``None`` is treated as a no-op.
         """
         if world_mask is None:
             return

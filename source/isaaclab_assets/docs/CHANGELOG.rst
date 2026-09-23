@@ -131,6 +131,51 @@ Added
 * Added configuration for Flexiv Rizon 4s with Grav parallel gripper for manipulation tasks.
 
 
+0.3.5 (2026-04-20)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :obj:`~isaaclab_assets.robots.ex001.EX001_CFG` configuration for the
+  base X2Robot EX001 arm (v00.04.04, ``ex001.usd``), loaded from
+  :obj:`~isaaclab.utils.assets.X2ROBOT_NUCLEUS_DIR`. Uses placeholder implicit
+  actuators pending joint-specific tuning after initial USD inspection.
+
+Changed
+^^^^^^^
+
+* :obj:`~isaaclab_assets.robots.ex001.EX001_6R_CFG` now coexists with the new
+  :obj:`~isaaclab_assets.robots.ex001.EX001_CFG` in
+  :mod:`isaaclab_assets.robots.ex001`; both share identical init state and
+  actuator tuning and differ only by the referenced USD (``ex001.usd`` vs
+  ``ex001_6r.usd``).
+
+
+0.3.4 (2026-04-16)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :obj:`~isaaclab_assets.robots.cx002.CX002_CFG` configuration for the
+  X2Robot CX002 arm (v00.02.04), loaded from
+  :obj:`~isaaclab.utils.assets.X2ROBOT_NUCLEUS_DIR`. Uses placeholder implicit
+  actuators pending joint-specific tuning after initial USD inspection.
+
+
+0.3.3 (2026-04-16)
+~~~~~~~~~~~~~~~~~~~
+
+Added
+^^^^^
+
+* Added :obj:`~isaaclab_assets.robots.ex001.EX001_6R_CFG` configuration for the
+  X2Robot EX001 6-axis arm (v00.04.04), loaded from
+  :obj:`~isaaclab.utils.assets.X2ROBOT_NUCLEUS_DIR`. Uses placeholder implicit
+  actuators pending joint-specific tuning after initial USD inspection.
+
+
 0.3.2 (2026-04-13)
 ~~~~~~~~~~~~~~~~~~~
 

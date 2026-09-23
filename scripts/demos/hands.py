@@ -135,8 +135,7 @@ def run_simulator(sim: "sim_utils.SimulationContext", entities: dict[str, "Artic
                     robot.data.default_joint_pos.torch.clone(),
                     robot.data.default_joint_vel.torch.clone(),
                 )
-                robot.write_joint_position_to_sim_index(position=joint_pos)
-                robot.write_joint_velocity_to_sim_index(velocity=joint_vel)
+                robot.write_joint_state_to_sim_index(position=joint_pos, velocity=joint_vel)
                 # reset the internal state
                 robot.reset()
             print("[INFO]: Resetting robots state...")

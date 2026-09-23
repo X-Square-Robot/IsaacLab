@@ -151,7 +151,7 @@ class SurfaceDeformableBodyMaterialCfg(PhysxSurfaceDeformableBodyMaterialCfg):
 
 @configclass
 class PhysxRigidBodyMaterialCfg(RigidBodyMaterialBaseCfg):
-    """PhysX-specific physics-material parameters for rigid bodies.
+    """PhysX-specific rigid body material parameters.
 
     Extends :class:`~isaaclab.sim.spawners.materials.RigidBodyMaterialBaseCfg` with the
     `PhysxMaterialAPI`_ schema fields: compliant-contact spring (stiffness/damping) and the
@@ -165,10 +165,13 @@ class PhysxRigidBodyMaterialCfg(RigidBodyMaterialBaseCfg):
     """
 
     # -- Class metadata (not dataclass fields) --
+    # Namespace for the fields declared below. ``apply_namespaced`` groups writes by the class
+    # that declares each field and reads the metadata from that class's own ``__dict__``, so the
+    # inherited ``physics`` namespace of ``RigidBodyMaterialBaseCfg`` does not cover these
+    # fields -- it only routes the base class's own (``physics:*``) ones.
+    _usd_namespace: ClassVar[str | None] = "physxMaterial"
     # USD applied schema written when at least one PhysX-namespaced field is set.
     _usd_applied_schema: ClassVar[str | None] = "PhysxMaterialAPI"
-    # Prim attribute namespace for PhysX-specific fields.
-    _usd_namespace: ClassVar[str | None] = "physxMaterial"
 
     compliant_contact_stiffness: float | None = None
     """Spring stiffness for a compliant contact model using implicit springs.
@@ -194,24 +197,10 @@ class PhysxRigidBodyMaterialCfg(RigidBodyMaterialBaseCfg):
     """
 
     friction_combine_mode: Literal["average", "min", "multiply", "max"] | None = None
-    """Determines the way friction will be combined during collisions.
-
-    .. attention::
-
-        When two physics materials with different combine modes collide, the combine mode with
-        the higher priority will be used. The priority order is provided `here
-        <https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/_api_build/structPxCombineMode.html>`__.
-    """
+    """Determines how friction combines during collisions. Defaults to None."""
 
     restitution_combine_mode: Literal["average", "min", "multiply", "max"] | None = None
-    """Determines the way restitution coefficient will be combined during collisions.
-
-    .. attention::
-
-        When two physics materials with different combine modes collide, the combine mode with
-        the higher priority will be used. The priority order is provided `here
-        <https://nvidia-omniverse.github.io/PhysX/physx/5.4.1/_api_build/structPxCombineMode.html>`__.
-    """
+    """Determines how restitution combines during collisions. Defaults to None."""
 
     damping_combine_mode: Literal["average", "min", "multiply", "max"] | None = None
     """Determines the way the (compliant-contact) damping coefficient is combined during collisions.
@@ -283,8 +272,7 @@ class PhysxMaterialCfg(RigidBodyMaterialFragment):
 
 @configclass
 class RigidBodyMaterialCfg(PhysxRigidBodyMaterialCfg):
-    """Deprecated: use :class:`PhysxRigidBodyMaterialCfg` or
-    :class:`~isaaclab.sim.spawners.materials.RigidBodyMaterialBaseCfg`.
+    """Deprecated: use :class:`PhysxRigidBodyMaterialCfg` or :class:`RigidBodyMaterialBaseCfg`.
 
     .. deprecated:: 4.6.22
         ``RigidBodyMaterialCfg`` has been split into
@@ -297,9 +285,9 @@ class RigidBodyMaterialCfg(PhysxRigidBodyMaterialCfg):
     def __post_init__(self):
         warnings.warn(
             "'RigidBodyMaterialCfg' is deprecated and will be removed in 5.0. Use"
-            " 'isaaclab_physx.sim.spawners.materials.PhysxRigidBodyMaterialCfg' for PhysX"
-            " properties, or 'isaaclab.sim.spawners.materials.RigidBodyMaterialBaseCfg' for"
-            " solver-common properties only.",
+            " 'isaaclab_physx.sim.spawners.materials.PhysxRigidBodyMaterialCfg' for PhysX-specific"
+            " material properties, or 'isaaclab.sim.spawners.materials.RigidBodyMaterialBaseCfg'"
+            " for solver-common properties only.",
             DeprecationWarning,
             stacklevel=2,
         )

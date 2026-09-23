@@ -15,6 +15,10 @@ _OVPHYSX_INSTALL_MESSAGE = (
     "Run your command with: uv run --extra ovphysx <command> "
     "(or, manually: python -m pip install --extra-index-url https://pypi.nvidia.com ovphysx)."
 )
+_OVSTAGE_INSTALL_MESSAGE = (
+    "The installed OvPhysX runtime requires its 'ovstage' companion package, which is not installed. "
+    "Reinstall the pinned runtime with: ./isaaclab.sh -i 'ov[ovphysx]'"
+)
 
 
 def import_ovphysx(module_name: str = "ovphysx") -> ModuleType:
@@ -35,3 +39,20 @@ def import_ovphysx(module_name: str = "ovphysx") -> ModuleType:
         if exc.name != "ovphysx":
             raise
         raise ModuleNotFoundError(_OVPHYSX_INSTALL_MESSAGE, name="ovphysx") from exc
+
+
+def import_ovstage() -> ModuleType:
+    """Import the optional ``ovstage`` companion with an actionable install error.
+
+    Returns:
+        The imported ``ovstage`` runtime module.
+
+    Raises:
+        ModuleNotFoundError: If ``ovstage`` is not installed.
+    """
+    try:
+        return importlib.import_module("ovstage")
+    except ModuleNotFoundError as exc:
+        if exc.name != "ovstage":
+            raise
+        raise ModuleNotFoundError(_OVSTAGE_INSTALL_MESSAGE, name="ovstage") from exc

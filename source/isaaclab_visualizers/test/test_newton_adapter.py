@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -23,6 +24,107 @@ from isaaclab_visualizers.newton_adapter import (
     log_geo_with_expanded_plane_scale,
     resolve_visible_env_indices,
 )
+
+
+def _newton_viewer_with_panel(
+    *, checkbox_values: dict[str, bool] | None = None, clicked_buttons: set[str] | None = None
+):
+    viewer = NewtonViewerGL.__new__(NewtonViewerGL)
+    viewer.model = SimpleNamespace(
+        up_axis=2,
+        gravity=SimpleNamespace(numpy=lambda: np.array([[0.0, 0.0, -9.81]], dtype=np.float32)),
+    )
+    viewer._backend_display = "Newton MJWarp"
+    viewer._paused_training = True
+    viewer._paused_rendering = False
+    viewer._pending_single_step = False
+    viewer._paused = True
+    viewer._reset_requested = False
+    viewer._update_frequency = 1
+    viewer._live_plots_callback = None
+
+    checkbox_values = checkbox_values or {}
+    clicked_buttons = clicked_buttons or set()
+    disabled = False
+    imgui = MagicMock()
+    imgui.Cond_ = SimpleNamespace(first_use_ever=0, appearing=1)
+    imgui.Col_ = SimpleNamespace(nav_cursor=0)
+    imgui.begin.return_value = True
+    imgui.collapsing_header.side_effect = lambda label: label == "Isaac Lab"
+    imgui.checkbox.side_effect = lambda label, value: (
+        (True, checkbox_values[label]) if label in checkbox_values else (False, value)
+    )
+
+    def _begin_disabled(value):
+        nonlocal disabled
+        disabled = value
+
+    def _end_disabled():
+        nonlocal disabled
+        disabled = False
+
+    imgui.begin_disabled.side_effect = _begin_disabled
+    imgui.end_disabled.side_effect = _end_disabled
+    imgui.button.side_effect = lambda label: not disabled and label in clicked_buttons
+    imgui.slider_int.side_effect = lambda _label, value, *_args: (False, value)
+    imgui.is_item_hovered.return_value = False
+    ui = SimpleNamespace(
+        imgui=imgui,
+        io=SimpleNamespace(display_size=(1280.0, 720.0)),
+        dpi_scale=1.0,
+        get_theme_color=lambda *_args: (1.0, 1.0, 1.0, 1.0),
+    )
+    gui = SimpleNamespace(
+        is_available=True,
+        _viewer=viewer,
+        ui=ui,
+        _ui_callbacks={
+            "panel": [],
+            "side": [viewer._render_training_controls],
+            "rendering": [],
+        },
+        _render_selection_panel=lambda: None,
+    )
+    viewer.gui = gui
+    viewer._patch_viewer_panel()
+    return viewer, gui, imgui
+
+
+def test_newton_viewer_panel_shows_native_simulation_controls_once():
+    _viewer, gui, imgui = _newton_viewer_with_panel()
+
+    gui._render_left_panel()
+
+    assert [call.args[0] for call in imgui.checkbox.call_args_list] == ["Pause"]
+    assert [call.args[0] for call in imgui.button.call_args_list] == ["Step", "Reset", "Pause Rendering"]
+
+
+def test_newton_viewer_native_pause_updates_isaaclab_pause_gate():
+    viewer, gui, _imgui = _newton_viewer_with_panel(checkbox_values={"Pause": False})
+
+    gui._render_left_panel()
+
+    assert viewer.is_training_paused() is False
+    assert viewer._paused is False
+
+
+def test_newton_viewer_native_step_releases_one_paused_tick():
+    viewer, gui, _imgui = _newton_viewer_with_panel(clicked_buttons={"Step"})
+
+    gui._render_left_panel()
+
+    assert viewer.is_training_paused() is False
+    assert viewer._pending_single_step is True
+    assert viewer._paused_training is True
+
+
+def test_newton_viewer_native_reset_requests_one_episode_reset():
+    viewer, gui, _imgui = _newton_viewer_with_panel(clicked_buttons={"Reset"})
+
+    gui._render_left_panel()
+
+    assert viewer.consume_reset_request() is True
+    assert viewer.consume_reset_request() is False
 
 
 def test_expand_infinite_plane_scale_expands_non_positive_extents():

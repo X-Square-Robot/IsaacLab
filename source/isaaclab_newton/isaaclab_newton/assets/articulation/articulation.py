@@ -41,7 +41,9 @@ from isaaclab_newton.assets import kernels as shared_kernels
 from isaaclab_newton.assets.articulation import kernels as articulation_kernels
 from isaaclab_newton.physics import NewtonManager as SimulationManager
 
+from ._osc_compat import OSCCompatArticulationView
 from .articulation_data import ArticulationData
+from .stable_pd_feeder import StablePDFeeder
 
 if TYPE_CHECKING:
     from isaaclab.assets.articulation.articulation_cfg import ArticulationCfg
@@ -324,12 +326,22 @@ class Articulation(BaseArticulation):
         return self.root_view.link_names
 
     @property
-    def root_view(self) -> ArticulationView:
+    def root_view(self) -> OSCCompatArticulationView:
         """Root view for the asset.
+
+        The returned object is an :class:`OSCCompatArticulationView` — a thin attribute-
+        proxy around :class:`newton.selection.ArticulationView` that adds PhysX-compatible
+        dynamics methods (``get_jacobians``, ``get_generalized_mass_matrices``,
+        ``get_gravity_compensation_forces``) needed by the operational space controller.
+        All other Newton view attributes and methods are forwarded transparently.
 
         .. note::
             Use this view with caution. It requires handling of tensors in a specific way.
         """
+        assert self._root_view is not None, (
+            "root_view accessed before the articulation was initialised or after it was"
+            " cleared. Ensure the articulation is fully spawned before reading dynamics."
+        )
         return self._root_view
 
     @property
@@ -3654,17 +3666,22 @@ class Articulation(BaseArticulation):
 
         root_prim_path_expr = _resolve_articulation_root_prim_path_expr(self.cfg)
         # -- articulation
-        self._root_view = ArticulationView(
+        # Build the underlying Newton selection view first, then wrap it so that
+        # the OSC action (task_space_actions.py) can call PhysX-style dynamics
+        # methods (get_jacobians / get_generalized_mass_matrices / ...).
+        _raw_root_view = ArticulationView(
             SimulationManager.get_model(),
             root_prim_path_expr.replace(".*", "*"),
             verbose=False,
             exclude_joint_types=[JointType.FREE, JointType.FIXED],
         )
+        self._root_view = OSCCompatArticulationView(_raw_root_view, state_accessor=SimulationManager.get_state_0)
         # Register view with Newton manager so sensors (e.g. FrameTransformer) can find it.
+        # The wrapper proxies unknown attributes to the underlying view via __getattr__.
         SimulationManager.get_physics_sim_view().append(self._root_view)
 
         # container for data access
-        self._data = ArticulationData(self.root_view, self.device)
+        self._data = ArticulationData(self.root_view, self.device)  # type: ignore[reportInvalidArgumentType]  # ty:ignore[invalid-argument-type]
 
         # Register callback to rebind simulation data after a full reset (model/state recreation).
         self._physics_ready_handle = SimulationManager.register_callback(
@@ -3821,7 +3838,7 @@ class Articulation(BaseArticulation):
     Internal helpers -- Actuators.
     """
 
-    def _process_actuators_cfg(self):
+    def _process_actuators_cfg(self):  # noqa: C901
         """Process and apply articulation joint properties."""
         # create actuators
         self.actuators = dict()
@@ -3841,7 +3858,13 @@ class Articulation(BaseArticulation):
         self.newton_default_damping: torch.Tensor | None = None
         self.newton_managed_local_joints: torch.Tensor | slice | None = None
 
-        _use_newton_actuators = getattr(self._sim_cfg, "use_newton_actuators", False)
+        resolve_actuator_settings = getattr(self.cfg, "resolve_newton_actuator_settings", None)
+        if callable(resolve_actuator_settings):
+            _use_newton_actuators, _, _ = resolve_actuator_settings(self._sim_cfg)
+        else:
+            # Compatibility for custom articulation cfg classes from older
+            # Isaac Lab releases that do not expose the per-articulation API.
+            _use_newton_actuators = getattr(self._sim_cfg, "use_newton_actuators", False)
 
         if _use_newton_actuators and not _HAS_NEWTON_ACTUATORS:
             logger.warning(
@@ -3936,6 +3959,59 @@ class Articulation(BaseArticulation):
                 self._implicit_dof_mask = binding.implicit_dof_mask
                 self._implicit_dof_mask_owner = binding.implicit_dof_mask_owner
                 self._data._sim_bind_joint_computed_effort = binding.computed_effort_view
+
+                # ControllerStablePD reads ``State.mass_matrix`` / ``bias_forces``
+                # each step (Tan 2011 implicit solve). Nothing else in the Newton
+                # fast path populates them, so register a graphable pre-actuator
+                # hook that feeds both from a single ``newton.eval_inverse_dynamics``
+                # call via StablePDFeeder (per-env index buffers precomputed at
+                # init; floating-base blocks are Schur-reduced against the 6 base
+                # DOFs — see stable_pd_feeder.py).
+                self._stable_pd_slices = adapter.stable_pd_actuator_slices(arti_start, self.num_joints)
+                if self._stable_pd_slices:
+                    art_ids = self._root_view.articulation_ids.numpy().reshape(-1).astype(np.int64)
+                    if art_ids.shape[0] != self.num_instances:
+                        raise RuntimeError(
+                            f"StablePD feeding expects one articulation per env; view exposes "
+                            f"{art_ids.shape[0]} articulations for {self.num_instances} instances."
+                        )
+                    actuator_dofs = [
+                        adapter.actuators[act_idx].indices.numpy().astype(np.int64).reshape(self.num_instances, -1)
+                        for act_idx, _ in self._stable_pd_slices
+                    ]
+                    # Per-actuator gravity-compensation mode from StablePDActuatorCfg. For
+                    # "feedforward" the gravity torque goes into the controller's
+                    # const_effort channel (effort-clamped, outside the implicit solve);
+                    # allocate it when the USD-built controller has none.
+                    from isaaclab_newton.actuators import resolve_stable_pd_gravity_modes  # noqa: PLC0415
+
+                    gravity_modes = resolve_stable_pd_gravity_modes(
+                        self._stable_pd_slices, self.cfg.actuators, self.find_joints
+                    )
+                    const_efforts: list[wp.array | None] = []
+                    for (act_idx, _), mode in zip(self._stable_pd_slices, gravity_modes):
+                        ctrl = adapter.actuators[act_idx].controller
+                        if mode == "feedforward" and ctrl.const_effort is None:
+                            ctrl.const_effort = wp.zeros_like(ctrl.kp)
+                        const_efforts.append(ctrl.const_effort if mode == "feedforward" else None)
+                    self._stable_pd_feeder = StablePDFeeder(
+                        model=SimulationManager.get_model(),
+                        articulation_indices=art_ids,
+                        actuator_dof_indices=actuator_dofs,
+                        num_base_dofs=0 if self._root_view.is_fixed_base else 6,
+                        device=self.device,
+                        gravity_modes=gravity_modes,
+                        const_effort_arrays=const_efforts,
+                    )
+
+                    def _pre_actuator_stable_pd() -> None:
+                        # Controller states double-buffer and swap each step; re-fetch.
+                        states = [adapter.current_controller_state(act_idx) for act_idx, _ in self._stable_pd_slices]
+                        self._stable_pd_feeder.feed(SimulationManager.get_state_0(), states)
+
+                    # graphable=True: feed() issues only newton eval_* / wp.launch
+                    # into pre-allocated buffers -- folds into the decimation graph.
+                    SimulationManager.register_pre_actuator_callback(_pre_actuator_stable_pd, graphable=True)
             else:
                 self._implicit_dof_mask, self._implicit_dof_mask_owner = build_implicit_dof_mask(
                     self.actuators,

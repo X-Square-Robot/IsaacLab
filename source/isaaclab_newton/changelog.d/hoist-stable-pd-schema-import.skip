@@ -1,0 +1,3 @@
+Internal refactor: hoisted the ``register_stable_pd_schema`` inline imports in
+``cloner/replicate.py`` and ``physics/newton_manager.py`` to module level. No
+user-facing change.

@@ -6,6 +6,7 @@
 import os
 import re
 import shutil
+import site
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -329,7 +330,17 @@ def _ensure_cuda_torch() -> None:
         check=False,
     )
 
-    run_command(pip_cmd + ["install", "--index-url", index_url, f"torch=={torch_ver}", f"torchvision=={tv_ver}"])
+    # torch/torchvision live ONLY on download.pytorch.org. The NVIDIA extra index
+    # (set up earlier via UV_EXTRA_INDEX_URL/PIP_EXTRA_INDEX_URL for isaacsim) does
+    # not host them, so leaving it in the environment makes uv/pip needlessly probe
+    # pypi.nvidia.com/torch/ -- which is empty and, on restricted networks, fails the
+    # whole install with a tcp-connect error. Strip those extras for this single,
+    # self-contained --index-url install so torch resolves from the torch index alone.
+    torch_env = {k: v for k, v in os.environ.items() if k not in ("UV_EXTRA_INDEX_URL", "PIP_EXTRA_INDEX_URL")}
+    run_command(
+        pip_cmd + ["install", "--index-url", index_url, f"torch=={torch_ver}", f"torchvision=={tv_ver}"],
+        env=torch_env,
+    )
 
 
 def _ensure_newton() -> None:
@@ -478,7 +489,8 @@ def _install_centralized_dependencies(pip_cmd: list[str], optional_submodules: l
     requested optional submodules are installed on top.
 
     Args:
-        pip_cmd: Base pip command (e.g. ``["uv", "pip"]`` or ``["python", "-m", "pip"]``).
+        pip_cmd: Base pip command (e.g. ``["uv", "--preview-features", "extra-build-dependencies", "pip"]``
+            or ``["python", "-m", "pip"]``).
         optional_submodules: Names of requested optional submodules whose root
             extras should also be installed.
     """
@@ -583,11 +595,13 @@ def _upgrade_extension_pip_dependencies(
 
 
 def _install_isaacsim() -> None:
-    """Install Isaac Sim pip package if not already present."""
+    """Install the pinned Isaac Sim pip package when needed."""
     python_exe = extract_python_exe()
     pip_cmd = get_pip_command(python_exe)
+    expected_ver = _pinned_version("isaacsim")
 
-    # Check if already installed.
+    # Keep the runtime package aligned with the repository lock, including
+    # downgrading a newer package when the publication contract requires it.
     result = run_command(
         [python_exe, "-c", "from importlib.metadata import version; print(version('isaacsim'))"],
         capture_output=True,
@@ -596,10 +610,13 @@ def _install_isaacsim() -> None:
     )
     if result.returncode == 0:
         installed_ver = result.stdout.strip()
-        print_info(f"Isaac Sim {installed_ver} already installed.")
-        return
+        if installed_ver == expected_ver:
+            print_info(f"Isaac Sim {installed_ver} already installed.")
+            return
+        print_info(f"Replacing Isaac Sim {installed_ver} with pinned version {expected_ver}...")
+    else:
+        print_info(f"Installing Isaac Sim {expected_ver}...")
 
-    print_info("Installing Isaac Sim...")
     using_uv = pip_cmd[0] == "uv"
     extra_flags = []
     if using_uv:
@@ -852,6 +869,7 @@ _PREBUNDLE_REPOINT_PACKAGES: list[str] = [
     "nvidia",
     "newton",
     "newton_actuators",
+    "newton_usd_schemas",
     "warp",
     "mujoco_warp",
     "websockets",
@@ -918,6 +936,9 @@ def _discover_prebundle_dirs() -> set[Path]:
     prebundle_dirs: set[Path] = set()
     for root in candidate_roots:
         prebundle_dirs.update(root.rglob("pip_prebundle"))
+        # omni.warp.core ships warp at its extension root (no pip_prebundle wrapper);
+        # include those roots so the bundled warp cannot shadow the env copy inside Kit.
+        prebundle_dirs.update(ext_root for ext_root in root.rglob("omni.warp.core*") if (ext_root / "warp").exists())
     return prebundle_dirs
 
 
@@ -993,7 +1014,17 @@ def _repoint_prebundle_packages() -> None:
 
     This is idempotent — existing symlinks that already point to the correct
     target are left untouched.
+
+    Set ``ISAACLAB_SKIP_PREBUNDLE_REPOINT=1`` to skip this step entirely. This
+    is required for kit-less installs into a dedicated environment that shares a
+    machine-wide ``_isaac_sim`` symlink with another environment: without it the
+    repoint would rewrite that shared Isaac Sim's prebundle to point at *this*
+    environment's ``site-packages``, corrupting the other environment.
     """
+    if os.environ.get("ISAACLAB_SKIP_PREBUNDLE_REPOINT") == "1":
+        print_info("ISAACLAB_SKIP_PREBUNDLE_REPOINT=1 set — skipping Isaac Sim prebundle repoint.")
+        return
+
     use_symlinks = not is_windows()
 
     isaacsim_path = extract_isaacsim_path(required=False)
@@ -1202,21 +1233,36 @@ def command_install(install_type: str = "all") -> None:
     # This prevents pip from scanning and managing packages in Isaac Sim's pip_prebundle directories,
     # which can cause those packages to be deleted or modified. This is especially important
     # in conda environments where Isaac Sim setup scripts add these paths to PYTHONPATH.
+    # Filter ALL `_isaac_sim` segments (not just `pip_prebundle`): the bundled cp312 stdlib dir lacks that token,
+    # and leaving it in PYTHONPATH makes the uv build subprocess import Isaac's old `platform.py`, which crashes
+    # on the conda-forge version string.
     saved_pythonpath = None
     filtered_pythonpath = None
     if "PYTHONPATH" in os.environ:
         saved_pythonpath = os.environ["PYTHONPATH"]
-        # Filter out any paths containing pip_prebundle (pre-bundled packages that pip shouldn't manage)
         paths = saved_pythonpath.split(os.pathsep)
-        filtered_paths = [p for p in paths if p and "pip_prebundle" not in p]
+        # Also drop the active env's own site-packages (prepended by isaaclab.sh to
+        # out-prioritize Kit's pip_prebundle at runtime): uv's isolated build
+        # subprocesses inherit PYTHONPATH, so the env's isaacsim-pinned packaging<24
+        # shadows the build env's packaging>=24.2 and breaks hatchling's PEP 639
+        # license validation (`No module named 'packaging.licenses'`).
+        env_site_packages = {os.path.normpath(p) for p in site.getsitepackages()}
+        filtered_paths = [
+            p
+            for p in paths
+            if p
+            and "/_isaac_sim/" not in p
+            and not p.endswith("/_isaac_sim")
+            and os.path.normpath(p) not in env_site_packages
+        ]
 
         if len(filtered_paths) != len(paths):
             filtered_pythonpath = os.pathsep.join(filtered_paths)
             os.environ["PYTHONPATH"] = filtered_pythonpath
             filtered_count = len(paths) - len(filtered_paths)
             print_info(
-                f"Temporarily filtering {filtered_count} Isaac Sim pre-bundled package path(s) from PYTHONPATH "
-                "during pip operations to prevent interference with pre-bundled packages."
+                f"Temporarily filtering {filtered_count} Isaac Sim / env site-packages path(s) "
+                "from PYTHONPATH during pip operations to prevent build/runtime interference."
             )
 
     pip_cmd = get_pip_command(python_exe)

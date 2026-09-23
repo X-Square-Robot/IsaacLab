@@ -71,6 +71,7 @@ def define_actuator_properties(
     prim_path: str,
     actuator_cfgs: dict[str, Any],
     stage: Any | None = None,
+    use_newton_actuators: bool | None = None,
 ) -> None:
     """Author ``NewtonActuator`` USD prims under an articulation root.
 
@@ -83,6 +84,8 @@ def define_actuator_properties(
 
     * :class:`~isaaclab.actuators.IdealPDActuatorCfg` →
       ``NewtonPDControlAPI`` + ``NewtonMaxEffortClampingAPI``
+    * :class:`~isaaclab.actuators.StablePDActuatorCfg` →
+      ``NewtonStablePDControlAPI`` + ``NewtonMaxEffortClampingAPI``
     * :class:`~isaaclab.actuators.DCMotorCfg` →
       ``NewtonPDControlAPI`` + ``NewtonDCMotorClampingAPI``
     * :class:`~isaaclab.actuators.DelayedPDActuatorCfg` →
@@ -93,11 +96,12 @@ def define_actuator_properties(
       :class:`~isaaclab.actuators.ActuatorNetLSTMCfg` →
       ``NewtonNeuralControlAPI`` (+ ``NewtonDCMotorClampingAPI``)
 
-    No-ops (returns immediately) when:
-
-    * the active :class:`~isaaclab.sim.SimulationContext` was configured
-      with ``use_newton_actuators=False`` (or no context is active), or
-    * *prim_path* does not resolve to a valid prim on the stage.
+    When the resolved articulation/simulation selection is
+    ``use_newton_actuators=False``, any existing ``NewtonActuator`` prims under
+    the articulation are deactivated so a referenced asset cannot leak native
+    actuators into a backend model.  The function returns without authoring new
+    prims in that case.  It also returns without action when *prim_path* does
+    not resolve to a valid prim on the stage.
 
     Must be called **after** the articulation is spawned (joint prims
     exist on stage) and **before** the cloner / ``ModelBuilder.add_usd``
@@ -111,24 +115,41 @@ def define_actuator_properties(
             :class:`~isaaclab.actuators.ActuatorBaseCfg`.
         stage: USD stage to author on. When ``None``, the current stage
             is used.
+        use_newton_actuators: Optional per-articulation selection. When
+            ``None``, inherit the active simulation configuration for backward
+            compatibility; when supplied, the caller has already combined the
+            simulation capability with the articulation opt-in.
     """
-    from isaaclab.sim import SimulationContext  # noqa: PLC0415
+    if use_newton_actuators is None:
+        from isaaclab.sim import SimulationContext  # noqa: PLC0415
 
-    sim_ctx = SimulationContext.instance()
-    sim_cfg = sim_ctx.cfg if sim_ctx is not None else None
-    if sim_cfg is None or not getattr(sim_cfg, "use_newton_actuators", False):
+        sim_ctx = SimulationContext.instance()
+        sim_cfg = sim_ctx.cfg if sim_ctx is not None else None
+        if sim_cfg is None:
+            # Preserve the historical no-op behavior when the helper is called
+            # outside an active simulation and no explicit selection was given.
+            return
+        use_newton_actuators = bool(getattr(sim_cfg, "use_newton_actuators", False))
+
+    if stage is None:
+        from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
+
+        stage = get_current_stage()
+    if stage is None:
+        # Keep the historical no-op behavior when authoring is requested before
+        # a USD stage exists (for example while importing a config in a unit test).
         return
 
     from isaaclab.sim.utils.queries import find_first_matching_prim  # noqa: PLC0415
-    from isaaclab.sim.utils.stage import get_current_stage  # noqa: PLC0415
 
-    if stage is None:
-        stage = get_current_stage()
-
-    first_prim = find_first_matching_prim(prim_path)
+    first_prim = find_first_matching_prim(prim_path, stage=stage)
     if first_prim is None:
         return
     articulation_prim_path = str(first_prim.GetPath())
+
+    if not use_newton_actuators:
+        _deactivate_actuator_prims(stage, articulation_prim_path)
+        return
 
     _author_actuator_prims(stage, articulation_prim_path, actuator_cfgs)
 
@@ -169,7 +190,11 @@ def _author_actuator_prims(
 
     from isaaclab.actuators import DCMotorCfg, DelayedPDActuatorCfg  # noqa: PLC0415
     from isaaclab.actuators.actuator_net_cfg import ActuatorNetLSTMCfg, ActuatorNetMLPCfg  # noqa: PLC0415
-    from isaaclab.actuators.actuator_pd_cfg import IdealPDActuatorCfg, RemotizedPDActuatorCfg  # noqa: PLC0415
+    from isaaclab.actuators.actuator_pd_cfg import (  # noqa: PLC0415
+        IdealPDActuatorCfg,
+        RemotizedPDActuatorCfg,
+        StablePDActuatorCfg,
+    )
 
     _SUPPORTED_CFG_TYPES = (
         IdealPDActuatorCfg,
@@ -197,6 +222,11 @@ def _author_actuator_prims(
         is_remotized = isinstance(cfg, RemotizedPDActuatorCfg)
         is_dc_motor = isinstance(cfg, DCMotorCfg)
         is_delayed = isinstance(cfg, DelayedPDActuatorCfg)
+        # StablePDActuatorCfg subclasses IdealPDActuatorCfg; check it explicitly so
+        # the Tan 2011 implicit controller (NewtonStablePDControlAPI → ControllerStablePD)
+        # is authored instead of the plain explicit-PD controller. Mutually exclusive
+        # with the DC-motor / delayed / remotized / neural variants above.
+        is_stable_pd = isinstance(cfg, StablePDActuatorCfg)
 
         vel_limit_map = resolve_per_dof(getattr(cfg, "velocity_limit", None), joint_names) if is_dc_motor else {}
         sat_effort_map = resolve_per_dof(getattr(cfg, "saturation_effort", None), joint_names) if is_dc_motor else {}
@@ -227,6 +257,14 @@ def _author_actuator_prims(
 
             if is_neural:
                 schemas.append("NewtonNeuralControlAPI")
+            elif is_stable_pd:
+                # Tan 2011 implicit stable-PD controller (kd folded into the
+                # mass-matrix solve). ``numWorlds`` is a shared controller param;
+                # left at the Newton default (1) here — multi-env authoring would
+                # set it to num_envs, which is not known at this pre-clone stage.
+                schemas.append("NewtonStablePDControlAPI")
+                attrs["kp"] = stiffness_map.get(jname, 0.0)
+                attrs["kd"] = damping_map.get(jname, 0.0)
             else:
                 schemas.append("NewtonPDControlAPI")
                 attrs["kp"] = stiffness_map.get(jname, 0.0)
@@ -335,6 +373,23 @@ def _remove_actuator_prims_for_joints(
 
     for prim in to_deactivate:
         prim.SetActive(False)
+
+
+def _deactivate_actuator_prims(stage: Any, articulation_prim_path: str) -> None:
+    """Deactivate every Newton actuator authored below an articulation root.
+
+    This is deliberately separate from :func:`_remove_actuator_prims_for_joints`:
+    the latter replaces only the joints covered by an enabled Lab actuator
+    group, whereas an articulation-level opt-out must prevent *all* referenced
+    native prims from entering a backend model.
+    """
+    art_prim = stage.GetPrimAtPath(articulation_prim_path)
+    if not art_prim.IsValid():
+        return
+
+    for prim in Usd.PrimRange(art_prim):
+        if prim.GetTypeName() == "NewtonActuator":
+            prim.SetActive(False)
 
 
 def _resave_checkpoint_with_metadata(

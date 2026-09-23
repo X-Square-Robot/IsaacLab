@@ -74,6 +74,45 @@ class SceneDataProvider:
         """Number of transforms available from the sim backend."""
         return self.backend.transform_count
 
+    @staticmethod
+    def _get_struct_device(data: Any, label: str) -> wp.Device | None:
+        """Return the shared device of the allocated arrays in a Warp struct."""
+        field_devices = {
+            field_name: field.device
+            for field_name in data._cls.vars
+            if (field := getattr(data, field_name)) is not None
+        }
+        if not field_devices:
+            return None
+
+        device = next(iter(field_devices.values()))
+        if any(field_device != device for field_device in field_devices.values()):
+            details = ", ".join(f"{field_name}={field_device}" for field_name, field_device in field_devices.items())
+            raise ValueError(f"{label} arrays must share one Warp device; got {details}.")
+        return device
+
+    @classmethod
+    def _resolve_struct_device(cls, data: Any, label: str, device: wp.DeviceLike = None) -> wp.Device:
+        """Resolve an explicit device or infer it from a Warp struct's allocated arrays."""
+        inferred_device = cls._get_struct_device(data, label)
+        if device is None:
+            if inferred_device is None:
+                raise ValueError(f"Cannot infer the Warp device from {label}; no arrays are allocated.")
+            return inferred_device
+
+        resolved_device = wp.get_device(device)
+        if inferred_device is not None and inferred_device != resolved_device:
+            raise ValueError(
+                f"{label} arrays are on {inferred_device}, but the requested Warp device is {resolved_device}."
+            )
+        return resolved_device
+
+    @staticmethod
+    def _validate_array_device(array: wp.array | None, device: wp.Device, label: str) -> None:
+        """Require an optional Warp array to reside on ``device``."""
+        if array is not None and array.device != device:
+            raise ValueError(f"{label} is on {array.device}, but the scene data backend is on {device}.")
+
     @property
     def usd_stage(self) -> Usd.Stage | None:
         """Pixar :class:`Usd.Stage` for visualizers and renderers that walk USD.
@@ -161,7 +200,9 @@ class SceneDataProvider:
                 for field_name in input._cls.vars:
                     setattr(output, field_name, getattr(input, field_name))
             else:
-                self.init_output(output)
+                device = self._resolve_struct_device(input, "backend transform data")
+                self._validate_array_device(mapping, device, "Transform mapping")
+                self.init_output(output, device=device)
                 for field_name in input._cls.vars:
                     wp.copy(getattr(output, field_name), getattr(input, field_name))
             return True
@@ -169,8 +210,16 @@ class SceneDataProvider:
         conversion_kernel_name = f"convert_{input._cls.__name__}_to_{output._cls.__name__}"
 
         if conversion_kernel := getattr(ConversionKernels, conversion_kernel_name, None):
-            self.init_output(output)
-            wp.launch(kernel=conversion_kernel, dim=self.transform_count, inputs=[input, mapping], outputs=[output])
+            device = self._resolve_struct_device(input, "backend transform data")
+            self._validate_array_device(mapping, device, "Transform mapping")
+            self.init_output(output, device=device)
+            wp.launch(
+                kernel=conversion_kernel,
+                dim=self.transform_count,
+                inputs=[input, mapping],
+                outputs=[output],
+                device=device,
+            )
             return True
 
         return False
@@ -181,21 +230,26 @@ class SceneDataProvider:
         | SceneDataFormat.Transform
         | SceneDataFormat.Matrix44
         | SceneDataFormat.Vec3_Matrix33,
+        device: wp.DeviceLike = None,
     ):
         """Allocate any uninitialized fields in ``output`` with empty Warp arrays.
 
         Only fields that are currently ``None`` are allocated; already-initialized
-        fields are left untouched.
+        fields are left untouched. All fields must reside on the backend device.
 
         Args:
             output: A :class:`SceneDataFormat` struct whose ``None``-valued fields
                 will be replaced with empty arrays of length :attr:`transform_count`.
+            device: Expected backend device for new arrays. When omitted, infer it
+                from the backend transform data.
         """
+        device = self._resolve_struct_device(self.backend.transforms, "backend transform data", device=device)
+        self._resolve_struct_device(output, "output transform data", device=device)
         for field_name, field_value in output._cls.vars.items():
             if getattr(output, field_name) is None:
-                setattr(output, field_name, wp.empty(self.transform_count, dtype=field_value.type.dtype))
+                setattr(output, field_name, wp.empty(self.transform_count, dtype=field_value.type.dtype, device=device))
 
-    def create_mapping(self, paths: list[str | None]) -> wp.array(dtype=wp.int32) | None:
+    def create_mapping(self, paths: list[str | None], device: wp.DeviceLike = None) -> wp.array(dtype=wp.int32) | None:
         """Create an index mapping from sim backend transforms to desired output ordering.
 
         For each transform in the sim backend, the resulting array stores the index into
@@ -206,6 +260,8 @@ class SceneDataProvider:
         Args:
             paths: Desired output ordering expressed as prim paths. Use ``None`` for
                 slots that should not receive any transform.
+            device: Expected backend device for the mapping. When omitted, infer it
+                from the backend transform data.
 
         Returns:
             A Warp int32 array of length :attr:`transform_count` containing the
@@ -218,13 +274,15 @@ class SceneDataProvider:
                 with contextlib.suppress(ValueError):
                     mapping[i] = paths.index(path)
             if not np.array_equal(mapping, np.arange(len(input_paths))):
-                return wp.array(mapping, dtype=wp.int32)
+                device = self._resolve_struct_device(self.backend.transforms, "backend transform data", device=device)
+                return wp.array(mapping, dtype=wp.int32, device=device)
         return None
 
     def create_geometry_mapping(
         self,
         paths: list[str | None],
         particle_offsets: list[int],
+        device: wp.DeviceLike = None,
     ) -> wp.array(dtype=wp.int32) | None:
         """Create a mapping from backend geometry entities to consumer particle offsets.
 
@@ -235,6 +293,8 @@ class SceneDataProvider:
         Args:
             paths: Desired consumer entity paths in particle-offset order.
             particle_offsets: Particle offset in the consumer buffer for each ``paths`` entry.
+            device: Expected backend device for the mapping. When omitted, infer it
+                from the backend point data.
 
         Returns:
             A Warp int32 array of length ``len(geometry_paths)`` containing destination
@@ -261,7 +321,8 @@ class SceneDataProvider:
 
         if identity and all(value >= 0 for value in mapping):
             return None
-        return wp.array(mapping, dtype=wp.int32)
+        device = self._resolve_struct_device(self.backend.points, "backend point data", device=device)
+        return wp.array(mapping, dtype=wp.int32, device=device)
 
     def get_points(
         self,
@@ -294,8 +355,12 @@ class SceneDataProvider:
             output.points = input_points.points
             return True
 
+        device = input_points.points.device
+        self._validate_array_device(mapping, device, "Geometry mapping")
         if output.points is None:
-            output.points = wp.empty(self.point_count, dtype=wp.vec3f)
+            output.points = wp.empty(self.point_count, dtype=wp.vec3f, device=device)
+        else:
+            self._validate_array_device(output.points, device, "Output point data")
 
         entity_counts = self.backend.geometry_counts
         if not entity_counts:
@@ -309,7 +374,7 @@ class SceneDataProvider:
             output.points,
             entity_counts,
             mapping,
-            device=str(output.points.device),
+            device=str(device),
         )
         return True
 

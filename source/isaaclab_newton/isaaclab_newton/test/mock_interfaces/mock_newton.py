@@ -30,7 +30,7 @@ class MockNewtonModel:
         is_fixed_base: bool = False,
     ):
         self.world_count = num_instances
-        self._gravity = wp.array([gravity] * (num_instances + 1), dtype=wp.vec3f, device=device)
+        self._gravity = wp.array([gravity] * num_instances, dtype=wp.vec3f, device=device)
         num_dofs = num_joints + (0 if is_fixed_base else 6)
         self.articulation_count = num_instances
         self.max_joints_per_articulation = num_bodies

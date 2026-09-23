@@ -8,7 +8,12 @@
 import importlib
 
 import pytest
-from isaaclab_ovphysx._runtime import _OVPHYSX_INSTALL_MESSAGE, import_ovphysx
+from isaaclab_ovphysx._runtime import (
+    _OVPHYSX_INSTALL_MESSAGE,
+    _OVSTAGE_INSTALL_MESSAGE,
+    import_ovphysx,
+    import_ovstage,
+)
 
 
 def test_import_ovphysx_reports_install_command_when_runtime_missing(monkeypatch):
@@ -39,6 +44,37 @@ def test_import_ovphysx_preserves_nested_missing_dependency(monkeypatch):
 
     with pytest.raises(ModuleNotFoundError) as exc_info:
         import_ovphysx()
+
+    assert exc_info.value.name == "carb"
+    assert "carb" in str(exc_info.value)
+
+
+def test_import_ovstage_reports_install_command_when_companion_missing(monkeypatch):
+    """Missing ``ovstage`` imports explain how to reinstall the pinned runtime."""
+
+    def import_module_raises_missing_ovstage(module_name: str):
+        raise ModuleNotFoundError("No module named 'ovstage'", name="ovstage")
+
+    monkeypatch.setattr(importlib, "import_module", import_module_raises_missing_ovstage)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        import_ovstage()
+
+    assert str(exc_info.value) == _OVSTAGE_INSTALL_MESSAGE
+    assert exc_info.value.name == "ovstage"
+    assert exc_info.value.__cause__.name == "ovstage"
+
+
+def test_import_ovstage_preserves_nested_missing_dependency(monkeypatch):
+    """Missing dependencies inside ``ovstage`` are not rewritten as install hints."""
+
+    def import_module_raises_missing_dependency(module_name: str):
+        raise ModuleNotFoundError("No module named 'carb'", name="carb")
+
+    monkeypatch.setattr(importlib, "import_module", import_module_raises_missing_dependency)
+
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        import_ovstage()
 
     assert exc_info.value.name == "carb"
     assert "carb" in str(exc_info.value)
